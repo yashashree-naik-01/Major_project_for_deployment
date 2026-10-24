@@ -22,7 +22,7 @@ function loadLocalEnvironment() {
     if (!match || !allowedNames.has(match[1]) || process.env[match[1]]) continue;
     let value = match[2].trim();
     if ((value.startsWith('"') && value.endsWith('"')) ||
-        (value.startsWith("'") && value.endsWith("'"))) value = value.slice(1, -1);
+      (value.startsWith("'") && value.endsWith("'"))) value = value.slice(1, -1);
     if (value) process.env[match[1]] = value;
   }
 }
@@ -33,7 +33,7 @@ const root = path.join(__dirname, 'dist');
 const mapLibreRoot = path.join(__dirname, 'node_modules', 'maplibre-gl', 'dist');
 const supabaseBrowserFile = path.join(__dirname, 'node_modules', '@supabase', 'supabase-js', 'dist', 'umd', 'supabase.js');
 const port = Number(process.env.PORT || 4173);
-const host = process.env.HOST || '127.0.0.1';
+const host = process.env.HOST || '0.0.0.0';
 const types = { '.html': 'text/html; charset=utf-8', '.css': 'text/css; charset=utf-8', '.js': 'text/javascript; charset=utf-8', '.mjs': 'text/javascript; charset=utf-8', '.map': 'application/json' };
 const graphHopperKey = process.env.GRAPHHOPPER_API_KEY || '';
 const graphHopperUrl = process.env.GRAPHHOPPER_URL || 'https://graphhopper.com/api/1/route';
@@ -123,10 +123,12 @@ function geoapifyGeocode(query, bias) {
     if (!Array.isArray(data.features)) throw new Error('invalid response');
     return data.features.map((feature, index) => {
       const properties = feature.properties || {}, coordinates = feature.geometry?.coordinates || [];
-      return { id: properties.place_id || `geoapify-${index}`, name: properties.name || properties.address_line1 || query,
+      return {
+        id: properties.place_id || `geoapify-${index}`, name: properties.name || properties.address_line1 || query,
         displayName: properties.formatted || [properties.address_line1, properties.address_line2].filter(Boolean).join(', ') || query,
         latitude: Number(properties.lat ?? coordinates[1]), longitude: Number(properties.lon ?? coordinates[0]),
-        type: properties.result_type || properties.category || '' };
+        type: properties.result_type || properties.category || ''
+      };
     });
   });
 }
@@ -139,7 +141,7 @@ async function geocode(req, res, requestUrl) {
   const key = `${query.toLocaleLowerCase('en')}|${bias ? `${bias.latitude.toFixed(3)},${bias.longitude.toFixed(3)}` : ''}`;
   const cached = geocodeCache.get(key);
   if (cached && Date.now() - cached.time < 86400000) return json(res, 200, { results: cached.results, cached: true });
-  nominatimQueue = nominatimQueue.catch(() => {}).then(async () => {
+  nominatimQueue = nominatimQueue.catch(() => { }).then(async () => {
     let results;
     if (geoapifyKey) try {
       results = await geoapifyGeocode(query, bias);
@@ -154,36 +156,44 @@ async function geocode(req, res, requestUrl) {
       url.searchParams.set('q', query); url.searchParams.set('format', 'jsonv2');
       url.searchParams.set('addressdetails', '1'); url.searchParams.set('limit', '5'); url.searchParams.set('countrycodes', 'in');
       if (bias) { url.searchParams.set('viewbox', `${bias.longitude - .5},${bias.latitude + .5},${bias.longitude + .5},${bias.latitude - .5}`); }
-      const response = await fetchWithTimeout(url, { headers: {
-        Accept: 'application/json', 'Accept-Language': 'en',
-        'User-Agent': `VisionGuide/2.0 (${nominatimContact})`
-      }});
+      const response = await fetchWithTimeout(url, {
+        headers: {
+          Accept: 'application/json', 'Accept-Language': 'en',
+          'User-Agent': `VisionGuide/2.0 (${nominatimContact})`
+        }
+      });
       if (!response.ok) throw new Error(`HTTP ${response.status}`);
       const items = await response.json();
       if (!Array.isArray(items)) throw new Error('invalid response');
-      results = items.map(item => ({ id: item.place_id, name: item.name || item.display_name?.split(',')[0],
-        displayName: item.display_name, latitude: Number(item.lat), longitude: Number(item.lon), type: item.type }));
+      results = items.map(item => ({
+        id: item.place_id, name: item.name || item.display_name?.split(',')[0],
+        displayName: item.display_name, latitude: Number(item.lat), longitude: Number(item.lon), type: item.type
+      }));
     } catch (nominatimError) {
       console.warn(`Nominatim search failed (${nominatimError.message}); trying Photon.`);
       const url = new URL(photonUrl);
       url.searchParams.set('q', query); url.searchParams.set('limit', '5'); url.searchParams.set('lang', 'en');
       url.searchParams.set('bbox', '68.1,6.4,97.4,35.7');
       if (bias) { url.searchParams.set('lat', String(bias.latitude)); url.searchParams.set('lon', String(bias.longitude)); }
-      const response = await fetchWithTimeout(url, { headers: {
-        Accept: 'application/geo+json, application/json', 'Accept-Language': 'en',
-        'User-Agent': `VisionGuide/2.0 (${nominatimContact})`
-      }});
+      const response = await fetchWithTimeout(url, {
+        headers: {
+          Accept: 'application/geo+json, application/json', 'Accept-Language': 'en',
+          'User-Agent': `VisionGuide/2.0 (${nominatimContact})`
+        }
+      });
       if (!response.ok) throw new Error(`Photon returned HTTP ${response.status}.`);
       const data = await response.json();
       if (!Array.isArray(data.features)) throw new Error('Photon returned an invalid response.');
       results = data.features.map((feature, index) => {
         const properties = feature.properties || {}, coordinates = feature.geometry?.coordinates || [];
         const displayName = [properties.name, properties.street, properties.city || properties.district,
-          properties.state, properties.country].filter((value, itemIndex, values) => value && values.indexOf(value) === itemIndex).join(', ');
-        return { id: `${properties.osm_type || 'photon'}${properties.osm_id || index}`,
+        properties.state, properties.country].filter((value, itemIndex, values) => value && values.indexOf(value) === itemIndex).join(', ');
+        return {
+          id: `${properties.osm_type || 'photon'}${properties.osm_id || index}`,
           name: properties.name || properties.city || query, displayName: displayName || query,
           latitude: Number(coordinates[1]), longitude: Number(coordinates[0]),
-          type: properties.osm_value || properties.type || '' };
+          type: properties.osm_value || properties.type || ''
+        };
       });
     }
     results = results.filter(item => Number.isFinite(item.latitude) && Number.isFinite(item.longitude));
@@ -193,8 +203,10 @@ async function geocode(req, res, requestUrl) {
   try { return json(res, 200, { results: await nominatimQueue }); }
   catch (error) {
     console.error(`Destination search failed: ${error.message}`);
-    return json(res, 502, { code: error.name === 'AbortError' ? 'PROVIDER_TIMEOUT' : 'PROVIDERS_UNAVAILABLE',
-      error: error.name === 'AbortError' ? 'Destination search timed out. Try again.' : 'Destination search providers are temporarily unavailable. Configure GEOAPIFY_API_KEY or try again later.' });
+    return json(res, 502, {
+      code: error.name === 'AbortError' ? 'PROVIDER_TIMEOUT' : 'PROVIDERS_UNAVAILABLE',
+      error: error.name === 'AbortError' ? 'Destination search timed out. Try again.' : 'Destination search providers are temporarily unavailable. Configure GEOAPIFY_API_KEY or try again later.'
+    });
   }
 }
 
@@ -218,15 +230,23 @@ function decodePolyline(encoded, precision = 6) {
 
 async function graphHopperRoute(from, to) {
   const url = new URL(graphHopperUrl); url.searchParams.set('key', graphHopperKey);
-  const response = await fetchWithTimeout(url, { method: 'POST', headers: { 'Content-Type': 'application/json', Accept: 'application/json' },
-    body: JSON.stringify({ profile: 'foot', points: [[Number(from.longitude), Number(from.latitude)], [Number(to.longitude), Number(to.latitude)]],
-      points_encoded: false, instructions: true, locale: 'en', elevation: false }) });
+  const response = await fetchWithTimeout(url, {
+    method: 'POST', headers: { 'Content-Type': 'application/json', Accept: 'application/json' },
+    body: JSON.stringify({
+      profile: 'foot', points: [[Number(from.longitude), Number(from.latitude)], [Number(to.longitude), Number(to.latitude)]],
+      points_encoded: false, instructions: true, locale: 'en', elevation: false
+    })
+  });
   const data = await response.json().catch(() => ({}));
   if (!response.ok || !data.paths?.length) throw new Error(data.message || data.hints?.[0]?.message || `GraphHopper returned HTTP ${response.status}.`);
   const pathData = data.paths[0];
-  return { distance: pathData.distance, time: pathData.time, coordinates: pathData.points?.coordinates || [],
-    steps: (pathData.instructions || []).map(step => ({ text: step.text, streetName: step.street_name,
-      distance: step.distance, time: step.time, sign: step.sign, interval: step.interval })) };
+  return {
+    distance: pathData.distance, time: pathData.time, coordinates: pathData.points?.coordinates || [],
+    steps: (pathData.instructions || []).map(step => ({
+      text: step.text, streetName: step.street_name,
+      distance: step.distance, time: step.time, sign: step.sign, interval: step.interval
+    }))
+  };
 }
 
 function turnSign(text) {
@@ -266,32 +286,44 @@ async function geoapifyRoute(from, to) {
   const steps = legs.flatMap((leg, legIndex) => (leg.steps || []).map(step => {
     const offset = legOffsets[legIndex] || 0;
     const text = step.instruction?.text || step.instruction || 'Continue straight.';
-    return { text, streetName: step.name || '', distance: Number(step.distance) || 0,
+    return {
+      text, streetName: step.name || '', distance: Number(step.distance) || 0,
       time: (Number(step.time) || 0) * 1000, sign: turnSign(text),
-      interval: [offset + (Number(step.from_index) || 0), offset + (Number(step.to_index) || 0)] };
+      interval: [offset + (Number(step.from_index) || 0), offset + (Number(step.to_index) || 0)]
+    };
   }));
-  return { distance: Number(feature.properties.distance) || legs.reduce((sum, leg) => sum + (Number(leg.distance) || 0), 0),
+  return {
+    distance: Number(feature.properties.distance) || legs.reduce((sum, leg) => sum + (Number(leg.distance) || 0), 0),
     time: (Number(feature.properties.time) || legs.reduce((sum, leg) => sum + (Number(leg.time) || 0), 0)) * 1000,
-    coordinates, steps };
+    coordinates, steps
+  };
 }
 
 async function valhallaRoute(from, to) {
-  const response = await fetchWithTimeout(valhallaUrl, { method: 'POST', headers: {
-    'Content-Type': 'application/json', Accept: 'application/json', 'User-Agent': `VisionGuide/2.0 (${nominatimContact})`,
-    'X-Client-Id': 'visionguide-local'
-  }, body: JSON.stringify({ locations: [{ lat: Number(from.latitude), lon: Number(from.longitude) },
-    { lat: Number(to.latitude), lon: Number(to.longitude) }], costing: 'pedestrian', units: 'kilometers', language: 'en-US' }) });
+  const response = await fetchWithTimeout(valhallaUrl, {
+    method: 'POST', headers: {
+      'Content-Type': 'application/json', Accept: 'application/json', 'User-Agent': `VisionGuide/2.0 (${nominatimContact})`,
+      'X-Client-Id': 'visionguide-local'
+    }, body: JSON.stringify({
+      locations: [{ lat: Number(from.latitude), lon: Number(from.longitude) },
+      { lat: Number(to.latitude), lon: Number(to.longitude) }], costing: 'pedestrian', units: 'kilometers', language: 'en-US'
+    })
+  });
   const data = await response.json().catch(() => ({}));
   const leg = data.trip?.legs?.[0], summary = data.trip?.summary;
   if (!response.ok || !leg?.shape || !summary) throw new Error(data.error || data.error_code || `Valhalla returned HTTP ${response.status}.`);
   const coordinates = decodePolyline(leg.shape, 6);
   if (coordinates.length < 2) throw new Error('Valhalla returned incomplete route geometry.');
-  return { distance: Number(summary.length) * 1000, time: Number(summary.time) * 1000, coordinates,
-    steps: (leg.maneuvers || []).map(maneuver => ({ text: maneuver.instruction || 'Continue straight',
+  return {
+    distance: Number(summary.length) * 1000, time: Number(summary.time) * 1000, coordinates,
+    steps: (leg.maneuvers || []).map(maneuver => ({
+      text: maneuver.instruction || 'Continue straight',
       streetName: maneuver.street_names?.[0] || '', distance: Number(maneuver.length) * 1000,
       time: Number(maneuver.time) * 1000,
       sign: /left/i.test(maneuver.instruction) ? -2 : /right/i.test(maneuver.instruction) ? 2 : 0,
-      interval: [Number(maneuver.begin_shape_index) || 0, Number(maneuver.end_shape_index) || 0] })) };
+      interval: [Number(maneuver.begin_shape_index) || 0, Number(maneuver.end_shape_index) || 0]
+    }))
+  };
 }
 
 function closestCoordinateIndex(coordinates, point, start = 0) {
@@ -323,9 +355,11 @@ async function osrmRoute(from, to) {
   const url = new URL(`${osrmFootUrl.replace(/\/$/, '')}/${coordinatesText}`);
   url.searchParams.set('overview', 'full'); url.searchParams.set('geometries', 'geojson');
   url.searchParams.set('steps', 'true');
-  const response = await fetchWithTimeout(url, { headers: {
-    Accept: 'application/json', 'Accept-Language': 'en', 'User-Agent': `VisionGuide/2.0 (${nominatimContact})`
-  }});
+  const response = await fetchWithTimeout(url, {
+    headers: {
+      Accept: 'application/json', 'Accept-Language': 'en', 'User-Agent': `VisionGuide/2.0 (${nominatimContact})`
+    }
+  });
   const data = await response.json().catch(() => ({})), routeData = data.routes?.[0];
   if (!response.ok || data.code !== 'Ok' || !routeData?.geometry?.coordinates?.length) {
     const error = new Error(data.message || data.code || `OSRM returned HTTP ${response.status}.`);
@@ -341,10 +375,12 @@ async function osrmRoute(from, to) {
   });
   const steps = rawSteps.map((step, index) => {
     const modifier = String(step.maneuver?.modifier || '');
-    return { text: osrmInstruction(step), streetName: step.name || '', distance: Number(step.distance) || 0,
+    return {
+      text: osrmInstruction(step), streetName: step.name || '', distance: Number(step.distance) || 0,
       time: (Number(step.duration) || 0) * 1000,
       sign: /left/.test(modifier) ? -2 : /right/.test(modifier) ? 2 : /uturn/.test(modifier) ? 4 : 0,
-      interval: [begins[index], begins[index + 1] ?? coordinates.length - 1] };
+      interval: [begins[index], begins[index + 1] ?? coordinates.length - 1]
+    };
   });
   return { distance: Number(routeData.distance) || 0, time: (Number(routeData.duration) || 0) * 1000, coordinates, steps };
 }
@@ -357,12 +393,16 @@ function normalizeRoute(result) {
   let steps = (result.steps || []).map(step => {
     const from = Math.max(0, Math.min(lastIndex, Math.trunc(Number(step.interval?.[0]) || 0)));
     const to = Math.max(from, Math.min(lastIndex, Math.trunc(Number(step.interval?.[1]) || from)));
-    return { text: String(step.text || 'Continue straight.').trim(), streetName: String(step.streetName || ''),
+    return {
+      text: String(step.text || 'Continue straight.').trim(), streetName: String(step.streetName || ''),
       distance: Math.max(0, Number(step.distance) || 0), time: Math.max(0, Number(step.time) || 0),
-      sign: Number(step.sign) || 0, interval: [from, to] };
+      sign: Number(step.sign) || 0, interval: [from, to]
+    };
   });
-  if (!steps.length) steps = [{ text: 'Begin walking on the displayed route.', streetName: '',
-    distance: Math.max(0, Number(result.distance) || 0), time: Math.max(0, Number(result.time) || 0), sign: 0, interval: [0, lastIndex] }];
+  if (!steps.length) steps = [{
+    text: 'Begin walking on the displayed route.', streetName: '',
+    distance: Math.max(0, Number(result.distance) || 0), time: Math.max(0, Number(result.time) || 0), sign: 0, interval: [0, lastIndex]
+  }];
   return { distance: Math.max(0, Number(result.distance) || 0), time: Math.max(0, Number(result.time) || 0), coordinates, steps };
 }
 
@@ -386,9 +426,11 @@ async function route(req, res) {
   }
   const noRoute = failures.length && failures.every(error => error.noRoute);
   console.error(`All walking route providers failed: ${failures.map(error => error.message).join(' | ')}`);
-  return json(res, noRoute ? 422 : 502, { code: noRoute ? 'NO_WALKABLE_ROUTE' : 'PROVIDERS_UNAVAILABLE', error: noRoute
-    ? 'No walkable route could be found between your current location and this destination.'
-    : 'Walking routing providers are temporarily unavailable. Configure GEOAPIFY_API_KEY or GRAPHHOPPER_API_KEY, or try again.' });
+  return json(res, noRoute ? 422 : 502, {
+    code: noRoute ? 'NO_WALKABLE_ROUTE' : 'PROVIDERS_UNAVAILABLE', error: noRoute
+      ? 'No walkable route could be found between your current location and this destination.'
+      : 'Walking routing providers are temporarily unavailable. Configure GEOAPIFY_API_KEY or GRAPHHOPPER_API_KEY, or try again.'
+  });
 }
 
 function validPhone(phone) {
@@ -411,9 +453,11 @@ async function authenticate(req) {
   const token = authorization.startsWith('Bearer ') ? authorization.slice(7).trim() : '';
   if (!token || token.length > 4096 || !supabaseAuthUserUrl || !supabasePublishableKey) return null;
   try {
-    const response = await fetchWithTimeout(supabaseAuthUserUrl, { headers: {
-      Accept: 'application/json', apikey: supabasePublishableKey, Authorization: `Bearer ${token}`
-    }}, 10000);
+    const response = await fetchWithTimeout(supabaseAuthUserUrl, {
+      headers: {
+        Accept: 'application/json', apikey: supabasePublishableKey, Authorization: `Bearer ${token}`
+      }
+    }, 10000);
     if (!response.ok) return null;
     const user = await response.json();
     return user?.id ? user : null;
@@ -456,9 +500,11 @@ async function sendSos(req, res) {
   else form.set('From', twilioFromNumber);
   const url = `${twilioApiBaseUrl}/2010-04-01/Accounts/${encodeURIComponent(twilioAccountSid)}/Messages.json`;
   try {
-    const response = await fetchWithTimeout(url, { method: 'POST', headers: {
-      ...twilioHeaders(), 'Content-Type': 'application/x-www-form-urlencoded;charset=UTF-8'
-    }, body: form.toString() }, 15000);
+    const response = await fetchWithTimeout(url, {
+      method: 'POST', headers: {
+        ...twilioHeaders(), 'Content-Type': 'application/x-www-form-urlencoded;charset=UTF-8'
+      }, body: form.toString()
+    }, 15000);
     const data = await response.json().catch(() => ({}));
     if (!response.ok || !data.sid) {
       sosRateLimits.delete(user.id);
@@ -475,8 +521,10 @@ async function sendSos(req, res) {
     return json(res, 202, { ok: true, messageId: data.sid, status, sentAt: new Date().toISOString() });
   } catch (error) {
     sosRateLimits.delete(user.id);
-    return json(res, 502, { code: 'SOS_PROVIDER_UNAVAILABLE',
-      error: error.name === 'AbortError' ? 'The SMS provider timed out. Use the phone SMS fallback.' : 'The SMS provider is unavailable. Use the phone SMS fallback.' });
+    return json(res, 502, {
+      code: 'SOS_PROVIDER_UNAVAILABLE',
+      error: error.name === 'AbortError' ? 'The SMS provider timed out. Use the phone SMS fallback.' : 'The SMS provider is unavailable. Use the phone SMS fallback.'
+    });
   }
 }
 
@@ -502,8 +550,12 @@ const server = http.createServer((req, res) => {
   try { requestUrl = new URL(req.url, 'http://localhost'); }
   catch { res.writeHead(400).end('Invalid request'); return; }
   if (req.method === 'GET' && requestUrl.pathname === '/api/public-config') {
-    json(res, 200, { supabase: { url: supabaseUrl, publishableKey: supabasePublishableKey,
-      configured: Boolean(supabaseUrl && supabasePublishableKey) } });
+    json(res, 200, {
+      supabase: {
+        url: supabaseUrl, publishableKey: supabasePublishableKey,
+        configured: Boolean(supabaseUrl && supabasePublishableKey)
+      }
+    });
     return;
   }
   if (req.method === 'GET' && requestUrl.pathname === '/api/geocode') { void geocode(req, res, requestUrl); return; }
