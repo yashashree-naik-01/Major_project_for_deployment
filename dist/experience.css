@@ -161,6 +161,7 @@ h1{font-size:2.65rem}h2{font-size:1.4rem}
 .nav-search-row{display:grid;grid-template-columns:minmax(0,1fr) 58px auto;gap:9px;align-items:stretch}.nav-search-row .search{width:100%}
 .nav-search-row button{min-height:58px}.nav-microphone{padding:12px;color:var(--blue);background:var(--soft)}.nav-microphone .icon{margin:0;width:25px;height:25px}
 .nav-field-block>small,.map-attribution-note{color:var(--muted);font-size:.72rem;line-height:1.5}.nav-suggestions h3,.nav-results h3{font-size:.95rem;margin-bottom:10px}
+.nav-origin-fallback{background:var(--soft);border:1px solid var(--line);border-radius:14px;padding:16px}.nav-origin-row{grid-template-columns:minmax(0,1fr) auto}.nav-origin-row .search{margin:0}.nav-origin-fallback .nav-results{margin-top:8px}
 .nav-result-list{display:grid;gap:8px}.nav-result-list button{display:grid;grid-template-columns:34px 1fr;gap:11px;text-align:left;align-items:center;padding:13px;background:var(--soft);border-color:var(--line)}
 .nav-result-list strong,.nav-result-list small{display:block}.nav-result-list small{color:var(--muted);font-weight:400;margin-top:3px;line-height:1.4}.nav-result-number{display:grid;place-items:center;width:30px;height:30px;border-radius:50%;background:var(--blue);color:var(--on-accent)}
 .navigation-map{height:360px;position:relative;border:1px solid var(--line);border-radius:18px;overflow:hidden;background:var(--soft)}.map-fallback{display:grid;place-items:center;height:100%;padding:20px;text-align:center;color:var(--muted)}
@@ -753,6 +754,11 @@ button.ocr-auto-active { background: #a855f7; color: #fff; border-color: #a855f7
 }
 .auth-loading strong { font-family: var(--display); font-size: 1.45rem; }
 .auth-loading p { margin: 6px 0 0; color: var(--muted); }
+.auth-demo { display:grid; gap:5px; margin-top:22px; padding:14px 16px; border:1px solid #cfd7ff; border-radius:13px; background:#f3f5ff; color:#34405d; font-size:.72rem; }
+.auth-demo strong { color:#2442ea; font:800 .74rem Manrope,sans-serif; }
+.auth-demo code { color:#111a33; font-weight:750; user-select:all; }
+.dark .auth-demo { background:#202947; border-color:#495a96; color:#dce1ff; }
+.dark .auth-demo strong,.dark .auth-demo code { color:#fff; }
 @keyframes auth-breathe { 50% { transform: scale(1.08); opacity: .3; } }
 @media (prefers-reduced-motion: reduce) { .auth-loading-mark span { animation: none; } }
 .dark .auth-feedback-error { color: #ffb4bb; background: #3b2025; border-color: #78414a; }

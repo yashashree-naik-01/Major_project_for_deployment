@@ -4,7 +4,7 @@ VisionGuide is an accessibility-focused browser app with live Camera Guide, OCR 
 
 ## Install and run
 
-Requirements: Node.js 18+, Chrome or Edge, a GraphHopper Directions API key for walking routes, a Supabase project for account authentication, and a Twilio Programmable Messaging account for automatic SOS SMS.
+Requirements: Node.js 18+ and Chrome or Edge. A Geoapify or GraphHopper API key is recommended for reliable search and walking routes; keyless local/prototype use can fall back to public OpenStreetMap services. A Supabase project is needed for production account authentication, and Twilio is needed for automatic SOS SMS.
 
 ```powershell
 npm.cmd install
@@ -13,15 +13,29 @@ npm.cmd start
 
 Open `http://127.0.0.1:4173`. Camera, microphone, and geolocation work on localhost or HTTPS and are requested only after the related control is selected.
 
-Before starting, open `.env.local` and set `GRAPHHOPPER_API_KEY`, `SUPABASE_URL`, and `SUPABASE_PUBLISHABLE_KEY`. You can also set `NOMINATIM_CONTACT=mailto:you@example.com` to identify this installation to the public Nominatim service. `.env.local` is ignored by Git and read only by `server.cjs`. The GraphHopper key remains server-side; the Supabase publishable key is intentionally provided to the browser and relies on Supabase Auth/RLS for security. Never use a Supabase secret or `service_role` key in this app. Server environment variables take precedence over this file. Optional provider overrides are:
+### Windows live-location checklist
+
+1. Open **Settings → Privacy & security → Location** (`ms-settings:privacy-location`). Turn on **Location services** and allow desktop apps to access location.
+2. In Chrome or Edge, open `http://127.0.0.1:4173`, open the site-permission control beside the address, and set **Location** to **Allow**. Reload after changing either Windows or browser permission.
+3. Open Navigate and select **Use my precise location**. VisionGuide first requests a fresh high-accuracy browser fix and keeps a continuous watcher running. The displayed `± metres` value is the accuracy reported by Windows/browser—not an accuracy claim made by VisionGuide.
+4. If Windows supplies only Wi-Fi positioning, the location may remain too coarse for live navigation. Keep the page open while waiting for improvement or use an HTTPS Android test; do not substitute a VPN/IP result or a manual preview for live GPS.
+
+For console diagnostics, `window.navigationUI.engine.location.getDiagnostics()` reports secure-context, browser-support, permission, watcher, best-accuracy, and fix-age state without inventing a position.
+
+Before starting, copy `.env.example` to `.env.local` when you want to configure production services. `GEOAPIFY_API_KEY` enables India-filtered Geoapify search and walking routes; obtain a key from the Geoapify dashboard. Set `NOMINATIM_CONTACT=mailto:you@example.com` to identify this installation when the public Nominatim fallback is used. Provider keys, `SUPABASE_URL`, and `SUPABASE_PUBLISHABLE_KEY` are optional for the local demo. `.env.local` is ignored by Git and read only by `server.cjs`. Provider keys remain server-side; the Supabase publishable key is intentionally provided to the browser and relies on Supabase Auth/RLS for security. Never use a Supabase secret or `service_role` key in this app. Server environment variables take precedence over this file. Optional provider overrides are:
 
 ```powershell
 $env:GRAPHHOPPER_URL='https://graphhopper.com/api/1/route'
+$env:GEOAPIFY_GEOCODE_URL='https://api.geoapify.com/v1/geocode/search'
+$env:GEOAPIFY_ROUTE_URL='https://api.geoapify.com/v1/routing'
 $env:NOMINATIM_URL='https://nominatim.openstreetmap.org/search'
+$env:PHOTON_URL='https://photon.komoot.io/api/'
+$env:VALHALLA_URL='https://valhalla1.openstreetmap.de/route'
+$env:OSRM_FOOT_URL='https://routing.openstreetmap.de/routed-foot/route/v1/driving'
 $env:HOST='0.0.0.0'
 ```
 
-For production or sustained traffic, point `NOMINATIM_URL` at a self-hosted or contract-compatible provider. VisionGuide deliberately searches only on form submission or a completed voice command, limits public Nominatim traffic to one serialized request per second, and caches identical queries in server memory for 24 hours. It does not implement autocomplete.
+For production or sustained traffic, configure Geoapify or GraphHopper and avoid depending on public demo services. With keys configured, route requests try GraphHopper, Geoapify, Valhalla, and pedestrian OSRM in that order; search prefers Geoapify and falls back to Nominatim then Photon. VisionGuide searches only on submission or a completed voice command, applies per-client request limits, serializes public Nominatim traffic to at most one request per second, and caches identical query/bias pairs in server memory for 24 hours. It does not implement autocomplete.
 
 ## Authentication
 
@@ -51,8 +65,9 @@ If automatic SMS is not configured or the provider rejects the request, mobile u
 
 The Navigate page provides:
 
-- Browser `watchPosition()` tracking with permission/error handling, weighted GPS smoothing, accuracy, heading, speed, and cleanup.
-- Coarse desktop locations can create a labeled approximate preview; live progress waits for usable GPS and resumes when a precise fix arrives.
+- Browser `watchPosition()` tracking with high-accuracy mode, zero cached age, freshness checks, weighted GPS smoothing, heading/speed, and cleanup.
+- Stale or coarse Wi-Fi/IP positions are rejected. Route calculation waits for a fresh position accurate to 80 metres or better instead of routing from a misleading approximate location.
+- Devices without usable GPS can search and select their real starting street, landmark, or station for an explicitly labeled route preview. Manual starts never masquerade as live GPS and cannot start turn-by-turn progress.
 - MapLibre GL JS with OpenStreetMap raster data, current position, destination, walking route, and completed route progress.
 - Submitted Nominatim-compatible destination search with up to five selectable matches.
 - GraphHopper `foot` routing through the local server, with the API key kept server-side.
@@ -71,7 +86,7 @@ Voice commands include:
 
 ## Privacy and safety
 
-Camera analysis remains in browser memory. Camera frames are not uploaded by VisionGuide. Destination text is sent through the local server to the configured Nominatim-compatible provider; route origin/destination coordinates are sent through the local server to GraphHopper. Map tiles are requested from OpenStreetMap for the displayed viewport. Email addresses and authentication sessions are handled by Supabase; passwords are sent directly to Supabase Auth and are never stored by VisionGuide. Saved places, contacts, preferences, and journey history remain in browser local storage. During a confirmed SOS, the primary contact's phone number and the user's coordinates/accuracy are sent through the server to Twilio for SMS delivery.
+Camera analysis remains in browser memory. Camera frames are not uploaded by VisionGuide. Destination text and an optional reliable proximity bias are sent through the local server to the configured geocoding provider. Route origin/destination coordinates are sent through the local server to the configured walking-route provider. API keys remain server-side. Map tiles are requested from OpenStreetMap for the displayed viewport. Email addresses and authentication sessions are handled by Supabase; passwords are sent directly to Supabase Auth and are never stored by VisionGuide. Saved places, contacts, preferences, and journey history remain in browser local storage. During a confirmed SOS, the primary contact's phone number and the user's coordinates/accuracy are sent through the server to Twilio for SMS delivery.
 
 VisionGuide is experimental and is not a certified mobility, collision-avoidance, or public emergency service. GPS, map data, routes, monocular depth, and detected obstacles can be inaccurate. SOS sends an SMS only to the saved personal contact; it does not call police, ambulance, fire services, or India's 112 service.
 
@@ -109,8 +124,12 @@ npm.cmd run test:browser
 npm.cmd audit --omit=dev
 ```
 
-`npm test` covers Supabase's client contract, SOS GPS/phone normalization/fallback, authenticated Twilio requests and delivery status, duplicate-send protection, existing Camera, voice, OCR/vision behavior, GPS, search, routing, progress, rerouting, and speech-priority logic. `npm run test:browser` starts its own temporary app server plus installed Chrome/Edge headlessly; it verifies the public/auth UI, rendered Navigate controls, emulated GPS, search selection, route start, a real MapLibre canvas, and navigation continuing when Camera Guide opens.
+`npm test` covers Supabase's client contract, SOS GPS/phone normalization/fallback, authenticated Twilio requests and delivery status, duplicate-send protection, existing Camera, voice, OCR/vision behavior, GPS permission/errors/jump rejection, search, Geoapify and OpenStreetMap-provider fallbacks, rate limits, normalized route geometry/steps, progress, rerouting, and speech-priority logic. `npm run test:browser` starts its own temporary app server plus installed Chrome/Edge headlessly; it verifies the public/auth UI, rendered Navigate controls, emulated GPS, manual preview, search selection, route start, a real MapLibre canvas, and navigation continuing when Camera Guide opens.
 
 ## Deployment
 
-Deploy `server.cjs`, `dist/`, `package.json`, `package-lock.json`, and installed production dependencies behind HTTPS. Set `HOST=0.0.0.0`, `GRAPHHOPPER_API_KEY`, `SUPABASE_URL`, `SUPABASE_PUBLISHABLE_KEY`, `TWILIO_ACCOUNT_SID`, `TWILIO_AUTH_TOKEN`, and either `TWILIO_FROM_NUMBER` or `TWILIO_MESSAGING_SERVICE_SID` in the server environment. Do not place the GraphHopper key, Twilio Auth Token, or any Supabase secret/service-role key in `dist/` or browser configuration. Add the final HTTPS origin to Supabase Auth's Site URL and redirect allow list. Mobile camera, microphone, and precise geolocation require an HTTPS origin; plain HTTP on a LAN IP is insufficient. A static-only deployment cannot provide protected routing or automatic SOS SMS with this architecture.
+Deploy `server.cjs`, `dist/`, `package.json`, `package-lock.json`, and installed production dependencies behind HTTPS. Set `HOST=0.0.0.0`, at least one reliable provider key (`GEOAPIFY_API_KEY` and/or `GRAPHHOPPER_API_KEY`), `SUPABASE_URL`, `SUPABASE_PUBLISHABLE_KEY`, `TWILIO_ACCOUNT_SID`, `TWILIO_AUTH_TOKEN`, and either `TWILIO_FROM_NUMBER` or `TWILIO_MESSAGING_SERVICE_SID` in the server environment. Do not place provider keys, the Twilio Auth Token, or any Supabase secret/service-role key in `dist/` or browser configuration. Add the final HTTPS origin to Supabase Auth's Site URL and redirect allow list. Mobile camera, microphone, and precise geolocation require an HTTPS origin; plain HTTP on a LAN IP is insufficient. A static-only deployment cannot provide protected routing or automatic SOS SMS with this architecture.
+
+For physical-phone GPS testing, expose this same Node server through an HTTPS deployment or trusted HTTPS development tunnel, open that HTTPS URL in current Android Chrome, allow precise location, and test outdoors with device GPS enabled. Confirm the accuracy value shown by VisionGuide before relying on spoken turns; desktop Wi-Fi location cannot validate phone GNSS behavior.
+
+Protect any development tunnel or deployment with an access policy or authenticated staging environment, keep provider/Twilio keys only on the server, and do not expose an unrestricted development backend to the public internet. On Android, enable system Location and precise location for Chrome, allow this HTTPS site's Location permission, keep the page visible, and prevent battery saver from suspending Chrome during the test. Ordinary browser pages are not reliable background-navigation services: updates and speech may pause when Chrome is backgrounded or the screen locks.

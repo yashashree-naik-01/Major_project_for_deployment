@@ -73,8 +73,12 @@ async function retry(fn, attempts = 40) {
   await evaluate(`document.querySelector('[data-action="landing"]').click()`);
   await delay(150);
   assert.equal(await evaluate(`!!document.querySelector('[data-action="guest"]')`), false);
-  await evaluate(`authenticated=true; onboarded=true; go('home')`);
+  await evaluate(`document.querySelector('[data-action="signin"]').click()`);
+  await delay(150);
+  assert.match(await evaluate(`document.querySelector('.auth-demo')?.innerText || ''`), /demo@visionguide\.local[\s\S]*visionguide/i);
+  await evaluate(`onboarded=true; document.querySelector('#auth-email').value='demo@visionguide.local'; document.querySelector('#auth-password').value='visionguide'; document.querySelector('#auth-form').requestSubmit()`);
   await delay(300);
+  assert.equal(await evaluate(`authenticated && !!document.querySelector('.product-shell')`), true);
   await evaluate(`document.querySelector('[data-action="navigate"]').click()`);
   await delay(500);
   const initial = await evaluate(`({text:document.querySelector('main').innerText, hasMap:!!document.querySelector('#navigation-map'), hasSearch:!!document.querySelector('#destination-search')})`);
@@ -91,6 +95,16 @@ async function retry(fn, attempts = 40) {
     if(String(url).includes('/api/route')) return new Response(JSON.stringify({distance:64,time:60000,coordinates:[[72.8347,19.0607],[72.835,19.0607],[72.8353,19.0607]],steps:[{text:'Continue straight',sign:0,interval:[0,1]},{text:'Turn right',sign:2,interval:[1,2]}]}),{status:200,headers:{'Content-Type':'application/json'}});
     throw new Error('Unexpected fetch '+url);
   }; window.navigationUI.engine.search.fetch=window.fetch.bind(window); window.navigationUI.engine.routing.fetch=window.fetch.bind(window); true`);
+  await evaluate(`document.querySelector('#origin-search').value='Airoli Station'; document.querySelector('#navigation-origin-form').requestSubmit()`);
+  await delay(300);
+  assert.equal(await evaluate(`document.querySelectorAll('[data-nav-action="origin-result"]').length`), 1);
+  await evaluate(`document.querySelector('[data-nav-action="origin-result"]').click()`);
+  await delay(200);
+  assert.match(await evaluate(`document.querySelector('#nav-gps-quality').textContent`), /manual preview/i);
+  assert.equal(await evaluate(`document.querySelector('[data-nav-action="start"]').disabled`), true);
+  await evaluate(`document.querySelector('[data-nav-action="location"]').click()`);
+  await delay(700);
+  assert.match(await evaluate(`document.querySelector('#nav-location-copy').textContent`), /live GPS/i);
   await evaluate(`document.querySelector('#destination-search').value='Test Library'; document.querySelector('#navigation-search-form').requestSubmit()`);
   await delay(300);
   const resultCount = await evaluate(`document.querySelectorAll('[data-nav-action="result"]').length`);
@@ -106,13 +120,26 @@ async function retry(fn, attempts = 40) {
   assert.match(await evaluate(`document.querySelector('#nav-route-status').textContent`), /running/i);
   const mapLoaded = await evaluate(`!!document.querySelector('#navigation-map canvas')`);
   assert.equal(mapLoaded, true, 'MapLibre renders an interactive canvas');
+  const routeDrawing = await retry(async () => {
+    const drawing = await evaluate(`(() => {
+      const map=window.navigationUI.map.map, data=map.getSource('vg-route').serialize().data;
+      return {
+        casing:!!map.getLayer('vg-route-casing'), route:!!map.getLayer('vg-route'), progress:!!map.getLayer('vg-progress'),
+        opacity:map.getPaintProperty('vg-route','line-opacity'), width:map.getPaintProperty('vg-route','line-width'),
+        type:data?.features?.[0]?.geometry?.type, points:data?.features?.[0]?.geometry?.coordinates?.length || 0
+      };
+    })()`);
+    if (drawing.points !== 3) throw new Error('MapLibre route source is not ready.');
+    return drawing;
+  });
+  assert.deepEqual(routeDrawing, { casing: true, route: true, progress: true, opacity: 0.95, width: 8, type: 'LineString', points: 3 });
   await evaluate(`document.querySelector('[data-action="camera"]').click()`);
   await delay(250);
   assert.equal(await evaluate(`window.navigationUI.isActive()`), true, 'navigation continues while Camera Guide is open');
   const stopped = await evaluate(`window.navigationUI.stop(); ({active:window.navigationUI.isActive(),watching:window.navigationUI.engine.location.isWatching(),location:window.navigationUI.getState().location})`);
   assert.deepEqual(stopped, { active: false, watching: false, location: null });
   assert.deepEqual(errors.filter(error => !/404 \(Not Found\)/.test(error)), []);
-  console.log(`PASS: public landing without demo access, Supabase auth UI, live navigation, search/result selection, route/start flow, and concurrent Camera Guide. MapLibre canvas loaded: ${mapLoaded}.`);
+  console.log(`PASS: public landing, local demo login, Supabase auth UI, live navigation, search/result selection, visible MapLibre route (${routeDrawing.points} points), start/progress flow, and concurrent Camera Guide.`);
   socket.close();
 })().catch(error => { console.error(error); process.exitCode = 1; }).finally(async () => {
   browser.kill();

@@ -8,7 +8,9 @@ function loadLocalEnvironment() {
 
   const allowedNames = new Set([
     'GRAPHHOPPER_API_KEY', 'GRAPHHOPPER_URL',
-    'NOMINATIM_URL', 'NOMINATIM_CONTACT',
+    'GEOAPIFY_API_KEY', 'GEOAPIFY_GEOCODE_URL', 'GEOAPIFY_ROUTE_URL',
+    'NOMINATIM_URL', 'NOMINATIM_CONTACT', 'PHOTON_URL', 'VALHALLA_URL', 'OSRM_FOOT_URL',
+    'PROVIDER_TIMEOUT_MS', 'GEOCODE_RATE_LIMIT_PER_MINUTE', 'ROUTE_RATE_LIMIT_PER_MINUTE',
     'SUPABASE_URL', 'SUPABASE_PUBLISHABLE_KEY', 'SUPABASE_AUTH_USER_URL',
     'TWILIO_ACCOUNT_SID', 'TWILIO_AUTH_TOKEN', 'TWILIO_FROM_NUMBER',
     'TWILIO_MESSAGING_SERVICE_SID', 'TWILIO_API_BASE_URL', 'HOST', 'PORT'
@@ -35,8 +37,17 @@ const host = process.env.HOST || '127.0.0.1';
 const types = { '.html': 'text/html; charset=utf-8', '.css': 'text/css; charset=utf-8', '.js': 'text/javascript; charset=utf-8', '.mjs': 'text/javascript; charset=utf-8', '.map': 'application/json' };
 const graphHopperKey = process.env.GRAPHHOPPER_API_KEY || '';
 const graphHopperUrl = process.env.GRAPHHOPPER_URL || 'https://graphhopper.com/api/1/route';
+const geoapifyKey = process.env.GEOAPIFY_API_KEY || '';
+const geoapifyGeocodeUrl = process.env.GEOAPIFY_GEOCODE_URL || 'https://api.geoapify.com/v1/geocode/search';
+const geoapifyRouteUrl = process.env.GEOAPIFY_ROUTE_URL || 'https://api.geoapify.com/v1/routing';
 const nominatimUrl = process.env.NOMINATIM_URL || 'https://nominatim.openstreetmap.org/search';
 const nominatimContact = process.env.NOMINATIM_CONTACT || 'local VisionGuide development';
+const photonUrl = process.env.PHOTON_URL || 'https://photon.komoot.io/api/';
+const valhallaUrl = process.env.VALHALLA_URL || 'https://valhalla1.openstreetmap.de/route';
+const osrmFootUrl = process.env.OSRM_FOOT_URL || 'https://routing.openstreetmap.de/routed-foot/route/v1/driving';
+const providerTimeout = Math.max(250, Math.min(60000, Number(process.env.PROVIDER_TIMEOUT_MS) || 15000));
+const geocodeRateLimit = Math.max(1, Math.min(600, Number(process.env.GEOCODE_RATE_LIMIT_PER_MINUTE) || 60));
+const routeRateLimit = Math.max(1, Math.min(600, Number(process.env.ROUTE_RATE_LIMIT_PER_MINUTE) || 60));
 const supabaseUrl = process.env.SUPABASE_URL || '';
 const supabasePublishableKey = process.env.SUPABASE_PUBLISHABLE_KEY || '';
 const supabaseAuthUserUrl = process.env.SUPABASE_AUTH_USER_URL || (supabaseUrl ? `${supabaseUrl.replace(/\/$/, '')}/auth/v1/user` : '');
@@ -46,13 +57,14 @@ const twilioFromNumber = process.env.TWILIO_FROM_NUMBER || '';
 const twilioMessagingServiceSid = process.env.TWILIO_MESSAGING_SERVICE_SID || '';
 const twilioApiBaseUrl = (process.env.TWILIO_API_BASE_URL || 'https://api.twilio.com').replace(/\/$/, '');
 const geocodeCache = new Map();
+const apiRateLimits = { geocode: new Map(), route: new Map() };
 const sosRateLimits = new Map();
 const sosMessages = new Map();
 let lastNominatimRequest = 0;
 let nominatimQueue = Promise.resolve();
 
-function json(res, status, body) {
-  res.writeHead(status, { 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': 'no-store' });
+function json(res, status, body, headers = {}) {
+  res.writeHead(status, { 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': 'no-store', ...headers });
   res.end(JSON.stringify(body));
 }
 
@@ -70,62 +82,313 @@ function validPoint(point) {
     Math.abs(Number(point.latitude)) <= 90 && Math.abs(Number(point.longitude)) <= 180;
 }
 
-async function fetchWithTimeout(url, options = {}, timeout = 15000) {
+async function fetchWithTimeout(url, options = {}, timeout = providerTimeout) {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), timeout);
   try { return await fetch(url, { ...options, signal: controller.signal }); }
   finally { clearTimeout(timer); }
 }
 
-async function geocode(res, requestUrl) {
+function requestAddress(req) {
+  return String(req.headers['x-forwarded-for'] || req.socket.remoteAddress || 'local').split(',')[0].trim();
+}
+
+function enforceRateLimit(req, res, bucket, limit, label) {
+  const now = Date.now(), cutoff = now - 60000, key = requestAddress(req);
+  const recent = (bucket.get(key) || []).filter(time => time > cutoff);
+  if (recent.length >= limit) {
+    const retryAfter = Math.max(1, Math.ceil((recent[0] + 60000 - now) / 1000));
+    json(res, 429, { code: 'RATE_LIMITED', error: `Too many ${label} requests. Try again in ${retryAfter} seconds.` }, { 'Retry-After': String(retryAfter) });
+    return false;
+  }
+  recent.push(now); bucket.set(key, recent); return true;
+}
+
+function searchBias(requestUrl) {
+  if (!requestUrl.searchParams.has('lat') || !requestUrl.searchParams.has('lon')) return null;
+  const latitude = Number(requestUrl.searchParams.get('lat'));
+  const longitude = Number(requestUrl.searchParams.get('lon'));
+  return validPoint({ latitude, longitude }) ? { latitude, longitude } : null;
+}
+
+function geoapifyGeocode(query, bias) {
+  const url = new URL(geoapifyGeocodeUrl);
+  url.searchParams.set('text', query); url.searchParams.set('format', 'geojson');
+  url.searchParams.set('filter', 'countrycode:in'); url.searchParams.set('limit', '5');
+  url.searchParams.set('lang', 'en'); url.searchParams.set('apiKey', geoapifyKey);
+  if (bias) url.searchParams.set('bias', `proximity:${bias.longitude},${bias.latitude}`);
+  return fetchWithTimeout(url, { headers: { Accept: 'application/geo+json, application/json' } }).then(async response => {
+    const data = await response.json().catch(() => ({}));
+    if (!response.ok) throw new Error(data.message || data.error || `HTTP ${response.status}`);
+    if (!Array.isArray(data.features)) throw new Error('invalid response');
+    return data.features.map((feature, index) => {
+      const properties = feature.properties || {}, coordinates = feature.geometry?.coordinates || [];
+      return { id: properties.place_id || `geoapify-${index}`, name: properties.name || properties.address_line1 || query,
+        displayName: properties.formatted || [properties.address_line1, properties.address_line2].filter(Boolean).join(', ') || query,
+        latitude: Number(properties.lat ?? coordinates[1]), longitude: Number(properties.lon ?? coordinates[0]),
+        type: properties.result_type || properties.category || '' };
+    });
+  });
+}
+
+async function geocode(req, res, requestUrl) {
+  if (!enforceRateLimit(req, res, apiRateLimits.geocode, geocodeRateLimit, 'destination search')) return;
   const query = String(requestUrl.searchParams.get('q') || '').trim();
   if (query.length < 3 || query.length > 160) return json(res, 400, { error: 'Enter a destination between 3 and 160 characters.' });
-  const key = query.toLocaleLowerCase('en');
+  const bias = searchBias(requestUrl);
+  const key = `${query.toLocaleLowerCase('en')}|${bias ? `${bias.latitude.toFixed(3)},${bias.longitude.toFixed(3)}` : ''}`;
   const cached = geocodeCache.get(key);
   if (cached && Date.now() - cached.time < 86400000) return json(res, 200, { results: cached.results, cached: true });
   nominatimQueue = nominatimQueue.catch(() => {}).then(async () => {
-    const wait = Math.max(0, 1050 - (Date.now() - lastNominatimRequest));
-    if (wait) await new Promise(resolve => setTimeout(resolve, wait));
-    lastNominatimRequest = Date.now();
-    const url = new URL(nominatimUrl);
-    url.searchParams.set('q', query); url.searchParams.set('format', 'jsonv2');
-    url.searchParams.set('addressdetails', '1'); url.searchParams.set('limit', '5');
-    const response = await fetchWithTimeout(url, { headers: {
-      Accept: 'application/json', 'Accept-Language': 'en',
-      'User-Agent': `VisionGuide/2.0 (${nominatimContact})`
-    }});
-    if (!response.ok) throw new Error(`Geocoder returned HTTP ${response.status}.`);
-    const items = await response.json();
-    const results = items.map(item => ({ id: item.place_id, name: item.name || item.display_name?.split(',')[0],
-      displayName: item.display_name, latitude: Number(item.lat), longitude: Number(item.lon), type: item.type }));
+    let results;
+    if (geoapifyKey) try {
+      results = await geoapifyGeocode(query, bias);
+    } catch (error) {
+      console.warn(`Geoapify search failed (${error.message}); trying OpenStreetMap providers.`);
+    }
+    if (!results) try {
+      const wait = Math.max(0, 1050 - (Date.now() - lastNominatimRequest));
+      if (wait) await new Promise(resolve => setTimeout(resolve, wait));
+      lastNominatimRequest = Date.now();
+      const url = new URL(nominatimUrl);
+      url.searchParams.set('q', query); url.searchParams.set('format', 'jsonv2');
+      url.searchParams.set('addressdetails', '1'); url.searchParams.set('limit', '5'); url.searchParams.set('countrycodes', 'in');
+      if (bias) { url.searchParams.set('viewbox', `${bias.longitude - .5},${bias.latitude + .5},${bias.longitude + .5},${bias.latitude - .5}`); }
+      const response = await fetchWithTimeout(url, { headers: {
+        Accept: 'application/json', 'Accept-Language': 'en',
+        'User-Agent': `VisionGuide/2.0 (${nominatimContact})`
+      }});
+      if (!response.ok) throw new Error(`HTTP ${response.status}`);
+      const items = await response.json();
+      if (!Array.isArray(items)) throw new Error('invalid response');
+      results = items.map(item => ({ id: item.place_id, name: item.name || item.display_name?.split(',')[0],
+        displayName: item.display_name, latitude: Number(item.lat), longitude: Number(item.lon), type: item.type }));
+    } catch (nominatimError) {
+      console.warn(`Nominatim search failed (${nominatimError.message}); trying Photon.`);
+      const url = new URL(photonUrl);
+      url.searchParams.set('q', query); url.searchParams.set('limit', '5'); url.searchParams.set('lang', 'en');
+      url.searchParams.set('bbox', '68.1,6.4,97.4,35.7');
+      if (bias) { url.searchParams.set('lat', String(bias.latitude)); url.searchParams.set('lon', String(bias.longitude)); }
+      const response = await fetchWithTimeout(url, { headers: {
+        Accept: 'application/geo+json, application/json', 'Accept-Language': 'en',
+        'User-Agent': `VisionGuide/2.0 (${nominatimContact})`
+      }});
+      if (!response.ok) throw new Error(`Photon returned HTTP ${response.status}.`);
+      const data = await response.json();
+      if (!Array.isArray(data.features)) throw new Error('Photon returned an invalid response.');
+      results = data.features.map((feature, index) => {
+        const properties = feature.properties || {}, coordinates = feature.geometry?.coordinates || [];
+        const displayName = [properties.name, properties.street, properties.city || properties.district,
+          properties.state, properties.country].filter((value, itemIndex, values) => value && values.indexOf(value) === itemIndex).join(', ');
+        return { id: `${properties.osm_type || 'photon'}${properties.osm_id || index}`,
+          name: properties.name || properties.city || query, displayName: displayName || query,
+          latitude: Number(coordinates[1]), longitude: Number(coordinates[0]),
+          type: properties.osm_value || properties.type || '' };
+      });
+    }
+    results = results.filter(item => Number.isFinite(item.latitude) && Number.isFinite(item.longitude));
     geocodeCache.set(key, { time: Date.now(), results });
     return results;
   });
   try { return json(res, 200, { results: await nominatimQueue }); }
-  catch (error) { return json(res, 502, { error: error.name === 'AbortError' ? 'Destination search timed out.' : 'Destination search provider is unavailable.' }); }
+  catch (error) {
+    console.error(`Destination search failed: ${error.message}`);
+    return json(res, 502, { code: error.name === 'AbortError' ? 'PROVIDER_TIMEOUT' : 'PROVIDERS_UNAVAILABLE',
+      error: error.name === 'AbortError' ? 'Destination search timed out. Try again.' : 'Destination search providers are temporarily unavailable. Configure GEOAPIFY_API_KEY or try again later.' });
+  }
+}
+
+function decodePolyline(encoded, precision = 6) {
+  const coordinates = []; let index = 0, latitude = 0, longitude = 0;
+  const decodeValue = () => {
+    let result = 0, shift = 0, byte;
+    do {
+      if (index >= encoded.length) throw new Error('Routing provider returned invalid geometry.');
+      byte = encoded.charCodeAt(index++) - 63; result |= (byte & 0x1f) << shift; shift += 5;
+    } while (byte >= 0x20);
+    return (result & 1) ? ~(result >> 1) : result >> 1;
+  };
+  const factor = 10 ** precision;
+  while (index < encoded.length) {
+    latitude += decodeValue(); longitude += decodeValue();
+    coordinates.push([longitude / factor, latitude / factor]);
+  }
+  return coordinates;
+}
+
+async function graphHopperRoute(from, to) {
+  const url = new URL(graphHopperUrl); url.searchParams.set('key', graphHopperKey);
+  const response = await fetchWithTimeout(url, { method: 'POST', headers: { 'Content-Type': 'application/json', Accept: 'application/json' },
+    body: JSON.stringify({ profile: 'foot', points: [[Number(from.longitude), Number(from.latitude)], [Number(to.longitude), Number(to.latitude)]],
+      points_encoded: false, instructions: true, locale: 'en', elevation: false }) });
+  const data = await response.json().catch(() => ({}));
+  if (!response.ok || !data.paths?.length) throw new Error(data.message || data.hints?.[0]?.message || `GraphHopper returned HTTP ${response.status}.`);
+  const pathData = data.paths[0];
+  return { distance: pathData.distance, time: pathData.time, coordinates: pathData.points?.coordinates || [],
+    steps: (pathData.instructions || []).map(step => ({ text: step.text, streetName: step.street_name,
+      distance: step.distance, time: step.time, sign: step.sign, interval: step.interval })) };
+}
+
+function turnSign(text) {
+  text = String(text || '').toLowerCase();
+  if (/u[ -]?turn/.test(text)) return 4;
+  if (/left/.test(text)) return -2;
+  if (/right/.test(text)) return 2;
+  return 0;
+}
+
+async function geoapifyRoute(from, to) {
+  const url = new URL(geoapifyRouteUrl);
+  url.searchParams.set('waypoints', `${Number(from.latitude)},${Number(from.longitude)}|${Number(to.latitude)},${Number(to.longitude)}`);
+  url.searchParams.set('mode', 'walk'); url.searchParams.set('format', 'geojson'); url.searchParams.set('lang', 'en');
+  url.searchParams.set('apiKey', geoapifyKey);
+  const response = await fetchWithTimeout(url, { headers: { Accept: 'application/geo+json, application/json' } });
+  const data = await response.json().catch(() => ({})), feature = data.features?.[0];
+  if (!response.ok || !feature?.geometry?.coordinates || !feature.properties) {
+    const error = new Error(data.message || data.error || `Geoapify returned HTTP ${response.status}.`);
+    error.noRoute = response.status === 404 || response.status === 422; throw error;
+  }
+  const geometry = feature.geometry;
+  const lines = geometry.type === 'MultiLineString' ? geometry.coordinates : geometry.type === 'LineString' ? [geometry.coordinates] : [];
+  const coordinates = [], legOffsets = [];
+  lines.forEach(line => {
+    const first = line[0], previous = coordinates.at(-1);
+    const sharedStart = Boolean(previous && first && Number(previous[0]) === Number(first[0]) && Number(previous[1]) === Number(first[1]));
+    legOffsets.push(Math.max(0, coordinates.length - (sharedStart ? 1 : 0)));
+    line.forEach((coordinate, index) => {
+      if (!Array.isArray(coordinate) || !Number.isFinite(Number(coordinate[0])) || !Number.isFinite(Number(coordinate[1]))) return;
+      if (index || !sharedStart)
+        coordinates.push([Number(coordinate[0]), Number(coordinate[1])]);
+    });
+  });
+  if (coordinates.length < 2) throw new Error('Geoapify returned incomplete route geometry.');
+  const legs = feature.properties.legs || [];
+  const steps = legs.flatMap((leg, legIndex) => (leg.steps || []).map(step => {
+    const offset = legOffsets[legIndex] || 0;
+    const text = step.instruction?.text || step.instruction || 'Continue straight.';
+    return { text, streetName: step.name || '', distance: Number(step.distance) || 0,
+      time: (Number(step.time) || 0) * 1000, sign: turnSign(text),
+      interval: [offset + (Number(step.from_index) || 0), offset + (Number(step.to_index) || 0)] };
+  }));
+  return { distance: Number(feature.properties.distance) || legs.reduce((sum, leg) => sum + (Number(leg.distance) || 0), 0),
+    time: (Number(feature.properties.time) || legs.reduce((sum, leg) => sum + (Number(leg.time) || 0), 0)) * 1000,
+    coordinates, steps };
+}
+
+async function valhallaRoute(from, to) {
+  const response = await fetchWithTimeout(valhallaUrl, { method: 'POST', headers: {
+    'Content-Type': 'application/json', Accept: 'application/json', 'User-Agent': `VisionGuide/2.0 (${nominatimContact})`,
+    'X-Client-Id': 'visionguide-local'
+  }, body: JSON.stringify({ locations: [{ lat: Number(from.latitude), lon: Number(from.longitude) },
+    { lat: Number(to.latitude), lon: Number(to.longitude) }], costing: 'pedestrian', units: 'kilometers', language: 'en-US' }) });
+  const data = await response.json().catch(() => ({}));
+  const leg = data.trip?.legs?.[0], summary = data.trip?.summary;
+  if (!response.ok || !leg?.shape || !summary) throw new Error(data.error || data.error_code || `Valhalla returned HTTP ${response.status}.`);
+  const coordinates = decodePolyline(leg.shape, 6);
+  if (coordinates.length < 2) throw new Error('Valhalla returned incomplete route geometry.');
+  return { distance: Number(summary.length) * 1000, time: Number(summary.time) * 1000, coordinates,
+    steps: (leg.maneuvers || []).map(maneuver => ({ text: maneuver.instruction || 'Continue straight',
+      streetName: maneuver.street_names?.[0] || '', distance: Number(maneuver.length) * 1000,
+      time: Number(maneuver.time) * 1000,
+      sign: /left/i.test(maneuver.instruction) ? -2 : /right/i.test(maneuver.instruction) ? 2 : 0,
+      interval: [Number(maneuver.begin_shape_index) || 0, Number(maneuver.end_shape_index) || 0] })) };
+}
+
+function closestCoordinateIndex(coordinates, point, start = 0) {
+  let bestIndex = start, bestDistance = Infinity;
+  for (let index = start; index < coordinates.length; index++) {
+    const longitude = coordinates[index][0] - point[0], latitude = coordinates[index][1] - point[1];
+    const distance = longitude * longitude + latitude * latitude;
+    if (distance < bestDistance) { bestDistance = distance; bestIndex = index; }
+  }
+  return bestIndex;
+}
+
+function osrmInstruction(step) {
+  const maneuver = step.maneuver || {}, modifier = String(maneuver.modifier || '').replace('uturn', 'U-turn');
+  const onto = step.name ? ` onto ${step.name}` : '';
+  if (maneuver.type === 'depart') return `Start ${modifier || 'walking'}${onto}.`;
+  if (maneuver.type === 'arrive') return 'You have arrived at your destination.';
+  if (maneuver.type === 'roundabout' || maneuver.type === 'rotary')
+    return `Enter the roundabout${maneuver.exit ? ` and take exit ${maneuver.exit}` : ''}${onto}.`;
+  if (maneuver.type === 'fork') return `Keep ${modifier || 'straight'}${onto}.`;
+  if (maneuver.type === 'merge') return `Merge ${modifier || 'straight'}${onto}.`;
+  if (maneuver.type === 'new name' || maneuver.type === 'continue' || maneuver.type === 'notification')
+    return `Continue ${modifier || 'straight'}${onto}.`;
+  return `Turn ${modifier || 'straight'}${onto}.`;
+}
+
+async function osrmRoute(from, to) {
+  const coordinatesText = `${Number(from.longitude)},${Number(from.latitude)};${Number(to.longitude)},${Number(to.latitude)}`;
+  const url = new URL(`${osrmFootUrl.replace(/\/$/, '')}/${coordinatesText}`);
+  url.searchParams.set('overview', 'full'); url.searchParams.set('geometries', 'geojson');
+  url.searchParams.set('steps', 'true');
+  const response = await fetchWithTimeout(url, { headers: {
+    Accept: 'application/json', 'Accept-Language': 'en', 'User-Agent': `VisionGuide/2.0 (${nominatimContact})`
+  }});
+  const data = await response.json().catch(() => ({})), routeData = data.routes?.[0];
+  if (!response.ok || data.code !== 'Ok' || !routeData?.geometry?.coordinates?.length) {
+    const error = new Error(data.message || data.code || `OSRM returned HTTP ${response.status}.`);
+    error.noRoute = data.code === 'NoRoute';
+    throw error;
+  }
+  const coordinates = routeData.geometry.coordinates;
+  const rawSteps = (routeData.legs || []).flatMap(leg => leg.steps || []);
+  let cursor = 0;
+  const begins = rawSteps.map(step => {
+    cursor = closestCoordinateIndex(coordinates, step.maneuver?.location || coordinates[cursor], cursor);
+    return cursor;
+  });
+  const steps = rawSteps.map((step, index) => {
+    const modifier = String(step.maneuver?.modifier || '');
+    return { text: osrmInstruction(step), streetName: step.name || '', distance: Number(step.distance) || 0,
+      time: (Number(step.duration) || 0) * 1000,
+      sign: /left/.test(modifier) ? -2 : /right/.test(modifier) ? 2 : /uturn/.test(modifier) ? 4 : 0,
+      interval: [begins[index], begins[index + 1] ?? coordinates.length - 1] };
+  });
+  return { distance: Number(routeData.distance) || 0, time: (Number(routeData.duration) || 0) * 1000, coordinates, steps };
+}
+
+function normalizeRoute(result) {
+  const coordinates = (result?.coordinates || []).map(coordinate => [Number(coordinate?.[0]), Number(coordinate?.[1])])
+    .filter(coordinate => Number.isFinite(coordinate[0]) && Number.isFinite(coordinate[1]) && Math.abs(coordinate[0]) <= 180 && Math.abs(coordinate[1]) <= 90);
+  if (coordinates.length < 2) throw new Error('Routing provider returned incomplete route geometry.');
+  const lastIndex = coordinates.length - 1;
+  let steps = (result.steps || []).map(step => {
+    const from = Math.max(0, Math.min(lastIndex, Math.trunc(Number(step.interval?.[0]) || 0)));
+    const to = Math.max(from, Math.min(lastIndex, Math.trunc(Number(step.interval?.[1]) || from)));
+    return { text: String(step.text || 'Continue straight.').trim(), streetName: String(step.streetName || ''),
+      distance: Math.max(0, Number(step.distance) || 0), time: Math.max(0, Number(step.time) || 0),
+      sign: Number(step.sign) || 0, interval: [from, to] };
+  });
+  if (!steps.length) steps = [{ text: 'Begin walking on the displayed route.', streetName: '',
+    distance: Math.max(0, Number(result.distance) || 0), time: Math.max(0, Number(result.time) || 0), sign: 0, interval: [0, lastIndex] }];
+  return { distance: Math.max(0, Number(result.distance) || 0), time: Math.max(0, Number(result.time) || 0), coordinates, steps };
 }
 
 async function route(req, res) {
-  if (!graphHopperKey) return json(res, 503, { error: 'Walking routing is not configured. Set GRAPHHOPPER_API_KEY on the server.' });
+  if (!enforceRateLimit(req, res, apiRateLimits.route, routeRateLimit, 'route calculation')) return;
   let body;
   try { body = await readJson(req); } catch (error) { return json(res, 400, { error: error.message }); }
   if (!validPoint(body.from) || !validPoint(body.to)) return json(res, 400, { error: 'Valid origin and destination coordinates are required.' });
-  const url = new URL(graphHopperUrl); url.searchParams.set('key', graphHopperKey);
-  try {
-    const response = await fetchWithTimeout(url, { method: 'POST', headers: { 'Content-Type': 'application/json', Accept: 'application/json' },
-      body: JSON.stringify({ profile: 'foot', points: [[Number(body.from.longitude), Number(body.from.latitude)], [Number(body.to.longitude), Number(body.to.latitude)]],
-        points_encoded: false, instructions: true, locale: 'en', elevation: false }) });
-    const data = await response.json().catch(() => ({}));
-    if (!response.ok || !data.paths?.length) return json(res, response.status >= 400 ? response.status : 502,
-      { error: data.message || data.hints?.[0]?.message || 'GraphHopper could not calculate a walking route.' });
-    const pathData = data.paths[0];
-    return json(res, 200, { distance: pathData.distance, time: pathData.time,
-      coordinates: pathData.points?.coordinates || [], steps: (pathData.instructions || []).map(step => ({
-        text: step.text, streetName: step.street_name, distance: step.distance, time: step.time, sign: step.sign, interval: step.interval
-      })) });
-  } catch (error) {
-    return json(res, 502, { error: error.name === 'AbortError' ? 'Walking route request timed out.' : 'Walking routing provider is unavailable.' });
+  const providers = [
+    ...(graphHopperKey ? [{ name: 'GraphHopper', request: graphHopperRoute }] : []),
+    ...(geoapifyKey ? [{ name: 'Geoapify', request: geoapifyRoute }] : []),
+    { name: 'Valhalla', request: valhallaRoute },
+    { name: 'OSRM foot', request: osrmRoute }
+  ];
+  const failures = [];
+  for (const provider of providers) {
+    try { return json(res, 200, normalizeRoute(await provider.request(body.from, body.to))); }
+    catch (error) {
+      failures.push(error); console.warn(`${provider.name} walking route failed (${error.message}); trying the next provider.`);
+    }
   }
+  const noRoute = failures.length && failures.every(error => error.noRoute);
+  console.error(`All walking route providers failed: ${failures.map(error => error.message).join(' | ')}`);
+  return json(res, noRoute ? 422 : 502, { code: noRoute ? 'NO_WALKABLE_ROUTE' : 'PROVIDERS_UNAVAILABLE', error: noRoute
+    ? 'No walkable route could be found between your current location and this destination.'
+    : 'Walking routing providers are temporarily unavailable. Configure GEOAPIFY_API_KEY or GRAPHHOPPER_API_KEY, or try again.' });
 }
 
 function validPhone(phone) {
@@ -243,7 +506,7 @@ const server = http.createServer((req, res) => {
       configured: Boolean(supabaseUrl && supabasePublishableKey) } });
     return;
   }
-  if (req.method === 'GET' && requestUrl.pathname === '/api/geocode') { void geocode(res, requestUrl); return; }
+  if (req.method === 'GET' && requestUrl.pathname === '/api/geocode') { void geocode(req, res, requestUrl); return; }
   if (req.method === 'POST' && requestUrl.pathname === '/api/route') { void route(req, res); return; }
   if (req.method === 'POST' && requestUrl.pathname === '/api/sos') { void sendSos(req, res); return; }
   if (req.method === 'GET' && requestUrl.pathname === '/api/sos-status') { void sosStatus(req, res, requestUrl); return; }

@@ -21,8 +21,10 @@
     constructor(route, options = {}) {
       this.route = route;
       this.offRouteConfirmations = options.offRouteConfirmations || 3;
-      this.maxUsableAccuracy = options.maxUsableAccuracy || 80;
+      this.arrivalConfirmations = options.arrivalConfirmations || 2;
+      this.maxUsableAccuracy = options.maxUsableAccuracy || 300;
       this.offRouteCount = 0;
+      this.arrivalCount = 0;
       this.lastAlong = 0;
       this.lengths = [0];
       for (let i = 1; i < route.coordinates.length; i++)
@@ -47,6 +49,7 @@
       const threshold = Math.max(30, Math.min(65, accuracy * 1.5));
       if (accuracy <= this.maxUsableAccuracy && best.distance > threshold) this.offRouteCount++;
       else if (best.distance <= threshold) this.offRouteCount = 0;
+      else this.offRouteCount = 0;
 
       const nearestIndex = best.segment + (best.t > .5 ? 1 : 0);
       let stepIndex = Math.max(0, this.route.steps.findIndex(step => Number(step.interval?.[1]) >= nearestIndex));
@@ -57,13 +60,15 @@
         nextStep ? Number(nextStep.interval?.[0]) || nearestIndex : Number(step.interval?.[1]) || nearestIndex);
       const distanceToManeuver = Math.max(0, (this.lengths[maneuverIndex] || this.lastAlong) - this.lastAlong);
       const remaining = Math.max(0, this.total - this.lastAlong);
+      const arrivalCandidate = usableAccuracy && accuracy <= 30 && remaining <= 15 && best.distance <= threshold;
+      this.arrivalCount = arrivalCandidate ? this.arrivalCount + 1 : 0;
 
       return {
         snapped: best.snapped, distanceFromRoute: best.distance,
         usableAccuracy,
         along: this.lastAlong, remaining, progress: this.total ? this.lastAlong / this.total : 0,
         nearestIndex, stepIndex, step, nextStep, displayStep: nextStep && distanceToManeuver <= 55 ? nextStep : step, distanceToManeuver,
-        arrived: remaining <= 15 && best.distance <= threshold,
+        arrived: this.arrivalCount >= this.arrivalConfirmations,
         shouldReroute: this.offRouteCount >= this.offRouteConfirmations
       };
     }

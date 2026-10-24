@@ -29,10 +29,14 @@
       if (!response.ok) throw new Error(body.error || 'A walking route could not be calculated.');
       if (!Array.isArray(body.coordinates) || body.coordinates.length < 2)
         throw new Error('The routing provider returned an incomplete walking route.');
+      const coordinates = body.coordinates.map(coordinate => [Number(coordinate?.[0]), Number(coordinate?.[1])]);
+      if (coordinates.some(coordinate => !Number.isFinite(coordinate[0]) || !Number.isFinite(coordinate[1]) ||
+        Math.abs(coordinate[0]) > 180 || Math.abs(coordinate[1]) > 90))
+        throw new Error('The routing provider returned invalid longitude/latitude coordinates.');
       return {
         distance: Number(body.distance) || 0,
         time: Number(body.time) || 0,
-        coordinates: body.coordinates,
+        coordinates,
         steps: (body.steps || []).map((step, index) => ({
           index,
           text: step.text || 'Continue straight',

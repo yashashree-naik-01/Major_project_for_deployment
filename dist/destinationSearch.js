@@ -8,14 +8,20 @@
       this.controller = null;
     }
 
-    async search(query) {
+    async search(query, options = {}) {
       query = String(query || '').trim();
       if (query.length < 3) throw new Error('Enter at least three characters to search.');
+      if (query.length > 160) throw new Error('Enter no more than 160 characters to search.');
       this.controller?.abort();
       this.controller = new AbortController();
       let response;
       try {
-        response = await this.fetch(`${this.endpoint}?q=${encodeURIComponent(query)}`, {
+        let requestUrl = `${this.endpoint}?q=${encodeURIComponent(query)}`;
+        const latitude = Number(options.latitude), longitude = Number(options.longitude);
+        if (Number.isFinite(latitude) && Number.isFinite(longitude) && Number(options.accuracy) <= 80) {
+          requestUrl += `&lat=${encodeURIComponent(latitude)}&lon=${encodeURIComponent(longitude)}`;
+        }
+        response = await this.fetch(requestUrl, {
           signal: this.controller.signal,
           headers: { Accept: 'application/json' }
         });
