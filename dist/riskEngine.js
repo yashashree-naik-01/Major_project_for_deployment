@@ -59,6 +59,7 @@
     enrich,           // (tracks, videoW, videoH) → enriched + sorted tracks
     computeSafeDir,   // (enrichedTracks, freeSpaceResult, videoW, videoH) → guidance
     validateLateralPath: _validateLateralPath,
+    estimateTraversability: _estimateTraversability,
     shouldAnnounceDir,
     markDirSent,
     reset: () => {
@@ -208,7 +209,15 @@
       right:  { label: 'Right',  colRange: [3, 5], xRange: [videoW * 2/3, videoW]      },
     };
 
-    // ── Populate zones ───────────────────────────────────────────
+    const hazard = freeSpaceResult?.hazard || null;
+
+    // Check if walking surface can be assessed at all (Requirement 9)
+    if (freeSpaceResult?.surfaceUnassessed) {
+      const stopSpeech = 'Unable to assess the walking surface. Stop and proceed only after checking with an established mobility aid or a sighted assistant.';
+      return { direction: 'stop', rawDirection: 'stop', speech: stopSpeech, zones: ZONES, confidence: 0, hazard, surfaceUnassessed: true };
+    }
+
+    // ── Populate zones & evaluate traversability (Requirements 1, 2, 3, 4, 6, 7) ──
     for (const [, zone] of Object.entries(ZONES)) {
       const [xMin, xMax] = zone.xRange;
 
@@ -218,17 +227,66 @@
         return cx >= xMin && cx < xMax;
       });
 
+      zone.obstacles = zone.tracks.map(t => ({
+        id: t.id,
+        label: t.label || 'unknown',
+        riskLevel: t.risk?.level || 'low',
+        riskScore: t.risk?.score || 0,
+        zone: t.distInfo?.zone || 'medium',
+        position: t.position || zone.label.toLowerCase()
+      }));
+
       // Free area % from freeSpaceAPI grid
+      let zoneCells = [];
       if (freeSpaceResult?.grid) {
         const [c0, c1] = zone.colRange;
-        const cells = freeSpaceResult.grid.filter(c => c.c >= c0 && c.c < c1);
-        const weights = cells.map(c => ({ cell:c, weight:c.r === 2 ? 3 : c.r === 1 ? 2 : 1 }));
-        const totalWeight = weights.reduce((sum,item)=>sum+item.weight,0);
-        const freeWeight = weights.reduce((sum,item)=>sum+(1-(item.cell.occupancy ?? (item.cell.status==='clear'?0:1)))*item.weight,0);
+        zoneCells = freeSpaceResult.grid.filter(c => c.c >= c0 && c.c < c1);
+        const weights = zoneCells.map(c => ({ cell:c, weight:c.r === 2 ? 3 : c.r === 1 ? 2 : 1 }));
+        const totalWeight = weights.reduce((sum, item) => sum + item.weight, 0);
+        const freeWeight = weights.reduce((sum, item) => {
+          const occ = (item.cell.status === 'dropoff' || item.cell.status === 'obstacle')
+            ? 1
+            : (item.cell.occupancy ?? (item.cell.status === 'clear' ? 0 : 1));
+          return sum + (1 - occ) * item.weight;
+        }, 0);
         zone.freePct = totalWeight ? Math.round(freeWeight/totalWeight*100) : 50;
       } else {
         zone.freePct = 50; // assume half clear if no grid
       }
+
+      // Aggregate surface categories & uncertainty (Requirements 3 & 4)
+      const surfaceCounts = { footpath: 0, road: 0, stairs: 0, wall: 0, floor: 0, terrain: 0, unknown: 0 };
+      let totalSurfCells = 0, sumSurfConf = 0;
+      zoneCells.forEach(c => {
+        const cat = c.surfaceCategory || 'unknown';
+        if (surfaceCounts[cat] !== undefined) surfaceCounts[cat]++;
+        else surfaceCounts.unknown++;
+        totalSurfCells++;
+        sumSurfConf += (c.surfaceConfidence || 0);
+      });
+      const topCat = Object.entries(surfaceCounts).sort(([,a],[,b]) => b - a)[0]?.[0] || 'unknown';
+      const avgSurfConf = totalSurfCells > 0 ? sumSurfConf / totalSurfCells : 0;
+      zone.surface = { primaryCategory: topCat, confidence: avgSurfConf, shares: surfaceCounts };
+
+      const unknownSurfRatio = totalSurfCells > 0 ? (surfaceCounts.unknown / totalSurfCells) : 0.5;
+      const trackUncertainty = zone.tracks.some(t => t.distInfo?.uncertain) ? 0.3 : 0.1;
+      const zoneUncertainty = Math.min(1, Math.max(0, unknownSurfRatio * 0.6 + trackUncertainty * 0.4));
+      zone.uncertainty = zoneUncertainty;
+
+      const hasDropInZone = zoneCells.some(c => c.status === 'dropoff');
+      const hasObsInZone = zoneCells.some(c => c.status === 'obstacle');
+      const hasDepthGround = zoneCells.some(c => c.depthGroundConfirmed);
+      const hasExplicitSurface = Boolean(freeSpaceResult?.surface || zoneCells.some(c => c.surfaceCategory && c.surfaceCategory !== 'unknown'));
+      const isSurfaceWalkable = (topCat === 'footpath' || topCat === 'floor') && avgSurfConf >= 0.30;
+      const hasSupportingEvidence = !hasDropInZone && !hasObsInZone && topCat !== 'wall' && topCat !== 'road' && topCat !== 'stairs' &&
+        (isSurfaceWalkable || (hasDepthGround && zone.freePct >= 65) || (!hasExplicitSurface && zone.freePct >= 65) || (zoneCells.length === 0 && zone.freePct >= 65));
+
+      zone.traversability = {
+        isWalkable: hasSupportingEvidence && zone.freePct >= 65,
+        hasSupportingEvidence,
+        isUnknown: !isSurfaceWalkable && !hasDepthGround && zone.tracks.length === 0,
+        uncertainty: zoneUncertainty
+      };
 
       // Aggregate risk metrics
       zone.maxRisk  = zone.tracks.length
@@ -242,17 +300,18 @@
       zone.closestDepth = _closestDepth(zone.tracks);
 
       // ── Zone safety score (higher = safer) ─────────────────────
-      // freePct baseline (0–100)
-      // minus risk penalties
       zone.safetyScore =
           zone.freePct
         - (zone.maxRisk * 0.55)
         - (zone.hasApproach ? 28 : 0)
-        - ({ danger: 35, close: 22, medium: 8, far: 0 }[zone.closestDepth] ?? 0);
+        - ({ danger: 35, close: 22, medium: 8, far: 0 }[zone.closestDepth] ?? 0)
+        - (zoneUncertainty * 15)
+        - (topCat === 'wall' ? 45 : 0)
+        - (topCat === 'road' ? 35 : 0)
+        + (isSurfaceWalkable ? 8 : 0);
     }
 
     // ── Incorporate ground hazard (drop-off, stairs, drain, pothole, curb, raised, broken) ──
-    const hazard = freeSpaceResult?.hazard || null;
     if (hazard && (hazard.type || hazard.category)) {
       const hazardType = hazard.category || hazard.type;
       const hazardCells = hazard.cells || [];
@@ -287,7 +346,8 @@
     const centreSafe = !isImminentHazard && (ZONES.center.safetyScore >= bestZone.safetyScore - (CFG.directionMargin || 12));
     const allBlocked = Object.values(ZONES).every(zone => zone.freePct < (CFG.blockedFreePercent ?? 35)) ||
                        (isImminentHazard && bestZone.safetyScore < 20);
-    const rawDir = allBlocked ? 'stop' : (isImminentHazard ? (hType === 'stairs-down' || hType === 'uncovered-drain' ? 'stop' : bestKey) : (centreSafe ? 'center' : bestKey));
+    const lateralPathValid = (bestKey === 'left' || bestKey === 'right') ? _validateLateralPath(bestKey, ZONES, freeSpaceResult) : false;
+    const rawDir = allBlocked ? 'stop' : (isImminentHazard ? ((hType === 'stairs-down' || hType === 'uncovered-drain' || !lateralPathValid) ? 'stop' : bestKey) : (centreSafe ? 'center' : bestKey));
     const finalDir = _stabilizeDirection(rawDir, ZONES);
 
     const speech = _buildSpeech(finalDir, ZONES, hazard, freeSpaceResult);
@@ -387,17 +447,32 @@
         if (hasUnsafeSurface) return false;
 
         // Safety rule: Unknown observations must not be interpreted as proof of safety!
-        const allUnknown = corridorCells.every(c =>
-          (c.surfaceCategory === 'unknown' || !c.surfaceCategory) &&
+        const allExplicitUnknown = corridorCells.every(c =>
+          c.surfaceCategory === 'unknown' &&
           (!c.surfaceConfidence || c.surfaceConfidence < 0.25)
         );
-        if (allUnknown && (!window.depthAPI || !window.depthAPI.isLoaded?.())) {
+        if ((allExplicitUnknown || freeSpaceResult?.surfaceUnassessed) && (!window.depthAPI || !window.depthAPI.isLoaded?.())) {
           return false;
         }
       }
     }
 
+    // 5. Must have sufficient supporting evidence (Requirement 8)
+    if (zone.traversability && !zone.traversability.hasSupportingEvidence) {
+      return false;
+    }
+
     return true;
+  }
+
+  function _estimateTraversability(zones, freeSpaceResult) {
+    if (!zones) return null;
+    return {
+      left: zones.left?.traversability || null,
+      center: zones.center?.traversability || null,
+      right: zones.right?.traversability || null,
+      surfaceAssessed: !freeSpaceResult?.surfaceUnassessed
+    };
   }
 
   function _buildSpeech(dir, zones, hazard, freeSpaceResult) {
@@ -418,7 +493,7 @@
           return 'Possible uncovered drain ahead. Proceed with caution.';
         }
         return (dirWord && pathValidated)
-          ? `Uncovered drain detected ahead. The ${dirWord} side appears clearer.`
+          ? `Uncovered drain detected ahead. The area to your ${dirWord} appears clearer, but the route is not fully verified.`
           : 'Uncovered drain detected ahead. Please stop.';
       }
 
@@ -428,7 +503,7 @@
           return 'Possible pothole ahead.';
         }
         return (dirWord && pathValidated)
-          ? `Pothole detected ahead. The ${dirWord} side appears clearer.`
+          ? `Pothole detected ahead. The area to your ${dirWord} appears clearer, but the route is not fully verified.`
           : 'Pothole detected ahead. Step carefully.';
       }
 
@@ -459,34 +534,56 @@
       // Drop-off
       if (type === 'dropoff') {
         if (hazard.confidence === 'uncertain') {
-          return (dirWord && pathValidated)
-            ? `Possible drop-off ahead. The ${dirWord} side appears clearer.`
-            : 'Possible drop-off ahead. Proceed with caution.';
+          return dir === 'stop'
+            ? 'Possible drop-off ahead. Stop.'
+            : (dirWord && pathValidated)
+            ? `Possible drop-off ahead. The area to your ${dirWord} appears clearer, but the route is not fully verified.`
+            : 'Possible drop-off ahead. Stop.';
         } else {
           return dir === 'stop'
             ? 'Drop-off detected ahead. Stop and check your step.'
             : (dirWord && pathValidated)
-            ? `Drop-off detected ahead. The ${dirWord} side appears clearer.`
-            : 'Drop-off detected ahead. Stop and check your surroundings.';
+            ? `Drop-off detected ahead. The area to your ${dirWord} appears clearer, but the route is not fully verified.`
+            : 'Drop-off detected ahead. Stop and check your step.';
         }
       } else if (type === 'stairs-down') {
+        if (hazard.alertMessage) return hazard.alertMessage;
         if (hazard.confidence === 'uncertain') {
           return 'Possible descending stairs ahead. Stop and check.';
         } else {
           return 'Descending stairs ahead. Stop and check your step.';
         }
       } else if (type === 'stairs-up') {
+        if (hazard.alertMessage) return hazard.alertMessage;
         if (hazard.confidence === 'uncertain') {
           return 'Possible steps ahead. Approach cautiously.';
         } else {
           return 'Stairs ahead leading up. Approach carefully.';
         }
       } else if (type === 'stairs-ambiguous') {
+        if (hazard.alertMessage) return hazard.alertMessage;
         return 'Possible steps ahead. Approach cautiously.';
       }
     }
 
-    if (dir === 'stop') return 'Obstacle patterns are detected across the view. Stop and check your surroundings.';
+    if (dir === 'stop') {
+      if (freeSpaceResult?.surfaceUnassessed) {
+        return 'Unable to assess the walking surface. Stop and proceed only after checking with an established mobility aid or a sighted assistant.';
+      }
+      if (highObjs.length) {
+        const obj = highObjs[0];
+        const isUnknown = !obj.label || obj.label === 'unknown' || obj.label === 'obstacle';
+        const name = isUnknown ? 'Unknown obstacle' : _cap(obj.label);
+        return `${name} is directly ahead — high risk. Please stop.`;
+      }
+      if (medObjs.length) {
+        const obj = medObjs[0];
+        const isUnknown = !obj.label || obj.label === 'unknown' || obj.label === 'obstacle';
+        const name = isUnknown ? 'Unknown obstacle' : _cap(obj.label);
+        return `${name} is directly ahead. Please stop.`;
+      }
+      return 'Obstacles are detected across your path. Please stop.';
+    }
 
     const noTrackedObjects = !cZ.tracks.length && !zones.left.tracks.length && !zones.right.tracks.length;
     const hasGridAlert = Object.values(zones).some(zone => zone.freePct < 85);
@@ -497,8 +594,8 @@
     }
 
     if (noTrackedObjects) {
-      if (isLateral && pathValidated) return `An obstacle pattern is detected ahead. The ${dir} side appears clearer.`;
-      return 'An unclassified obstacle pattern may be ahead. Proceed with caution.';
+      if (isLateral && pathValidated) return `Unknown obstacle ahead. The area to your ${dir} appears clearer, but the route is not fully verified.`;
+      return 'Unknown obstacle ahead. Proceed with caution.';
     }
 
     // Centre safe enough
@@ -510,26 +607,33 @@
 
     // High risk in centre
     if (highObjs.length) {
-      const name = _cap(highObjs[0].label);
-      const mot  = highObjs[0].motion?.trajectory;
+      const obj = highObjs[0];
+      const isUnknown = !obj.label || obj.label === 'unknown' || obj.label === 'obstacle';
+      const name = isUnknown ? 'Unknown obstacle' : _cap(obj.label);
+      const mot  = obj.motion?.trajectory;
       const motWord = mot === 'approaching' ? ', approaching fast' : '';
       if (pathValidated) {
-        return `${name} ahead${motWord} — high risk. Move ${dirWord}. The ${dirWord} side appears clearer.`;
+        return `${name} ahead${motWord} — high risk. Move ${dirWord}. The ${dirWord} side appears clearer, but the route is not fully verified.`;
       }
-      return `${name} ahead${motWord} — high risk. Check your surroundings before stepping aside.`;
+      return `${name} is directly ahead${motWord} — high risk. Please stop.`;
     }
 
     // Medium risk in centre
     if (medObjs.length) {
+      const obj = medObjs[0];
+      const isUnknown = !obj.label || obj.label === 'unknown' || obj.label === 'obstacle';
+      const name = isUnknown ? 'Unknown obstacle' : _cap(obj.label);
+      const mot  = obj.motion?.trajectory;
+      const motWord = mot === 'approaching' ? ', approaching' : '';
       if (pathValidated) {
-        return `Obstacle ahead. Move slightly ${dirWord}. The ${dirWord} path appears safer.`;
+        return `${name} ahead${motWord}. The area to your ${dirWord} appears clearer, but the route is not fully verified.`;
       }
-      return 'Obstacle directly ahead. Check your surroundings before stepping aside.';
+      return `${name} is directly ahead${motWord}. Stop and wait.`;
     }
 
     // Centre clear but other zones are safer
     if (pathValidated) {
-      return `${dir === 'left' ? 'Left' : 'Right'} path appears clearest. Move slightly ${dirWord}.`;
+      return `The area to your ${dirWord} appears clearer, but the route is not fully verified.`;
     }
     return 'No tracked obstacle is in the centre. Continue carefully.';
   }

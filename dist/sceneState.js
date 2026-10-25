@@ -117,7 +117,11 @@
     return Object.freeze({
       freePercent: zone.freePct ?? null,
       riskLevel: zone.riskLevel || 'low',
-      safetyScore: Number.isFinite(zone.safetyScore) ? Math.round(zone.safetyScore) : null
+      safetyScore: Number.isFinite(zone.safetyScore) ? Math.round(zone.safetyScore) : null,
+      isWalkable: Boolean(zone.traversability?.isWalkable),
+      hasSupportingEvidence: Boolean(zone.traversability?.hasSupportingEvidence),
+      uncertainty: Number(zone.uncertainty ?? 0),
+      surfaceCategory: zone.surface?.primaryCategory || 'unknown'
     });
   }
 

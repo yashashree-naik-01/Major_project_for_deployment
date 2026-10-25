@@ -63,6 +63,8 @@ async function retry(fn, attempts = 40) {
   await send('Browser.grantPermissions', { origin: `http://127.0.0.1:${appPort}`, permissions: ['geolocation'] });
   await send('Emulation.setGeolocationOverride', { latitude: 19.0607, longitude: 72.8347, accuracy: 8 });
   await delay(900);
+  await send('Page.navigate', { url: `http://127.0.0.1:${appPort}/` });
+  await delay(1200);
   const publicLanding = await evaluate(`({hero:!!document.querySelector('.landing-hero'),signIn:!!document.querySelector('[data-action="signin"]'),title:document.querySelector('h1')?.textContent})`);
   assert(publicLanding.hero && publicLanding.signIn);
   assert.match(publicLanding.title, /world feels clearer/i);

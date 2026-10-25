@@ -55,6 +55,7 @@
     isActive: () => detectionActive,
     describeLatest,
     announceScene: _announceScene,
+    formatObjectDescription,
   };
 
   /* ═══════════════════════════════════════════════════════════════
@@ -241,10 +242,10 @@
           window.guidanceAPI.reportSystemStatus({
             type: 'model',
             level: 'error',
-            message: 'Live visual analysis is temporarily unavailable. Stop and check your surroundings.'
+            message: 'Live visual analysis is temporarily unavailable. Camera view may be obscured or lighting is too low. Please stop.'
           });
         } else {
-          window.guidanceAPI?.announce?.('Live visual analysis is temporarily unavailable. Stop and check your surroundings.', {
+          window.guidanceAPI?.announce?.('Live visual analysis is temporarily unavailable. Camera view may be obscured or lighting is too low. Please stop.', {
             key: 'health:error:model', priority: 95, interrupt: true, cooldownMs: 25000
           });
         }
@@ -501,33 +502,130 @@
   }
 
   /* ═══════════════════════════════════════════════════════════════
+     OBJECT DESCRIPTION FORMATTER
+  ═══════════════════════════════════════════════════════════════ */
+  function formatObjectDescription(track, videoWidth = 300) {
+    if (!track) return '';
+    const rawLabel = String(track.label || track.class || '').trim().toLowerCase();
+    const isUnknown = !rawLabel || rawLabel === 'unknown' || rawLabel === 'obstacle';
+
+    // Position calculation
+    let posText = 'directly ahead';
+    if (track.bbox && Array.isArray(track.bbox) && track.bbox.length >= 3) {
+      const [x, , w] = track.bbox;
+      const vw = Number(videoWidth) || 300;
+      const normX = (x + w / 2) / vw;
+      if (normX < 0.22) {
+        posText = 'on your far left';
+      } else if (normX < 0.38) {
+        posText = 'ahead, slightly to your left';
+      } else if (normX > 0.78) {
+        posText = 'on your far right';
+      } else if (normX > 0.62) {
+        posText = 'ahead, slightly to your right';
+      } else {
+        posText = 'directly ahead';
+      }
+    } else if (track.position) {
+      if (track.position === 'left') posText = 'ahead, slightly to your left';
+      else if (track.position === 'right') posText = 'ahead, slightly to your right';
+      else posText = 'directly ahead';
+    }
+
+    if (isUnknown) {
+      const prefix = rawLabel === 'obstacle' ? 'Obstacle' : 'Unknown obstacle';
+      if (posText === 'directly ahead') return `${prefix} ahead.`;
+      return `${prefix} ${posText}.`;
+    }
+
+    const isVowel = /^[aeiou]/i.test(rawLabel);
+    const article = isVowel ? 'An' : 'A';
+    const name = `${article} ${rawLabel}`;
+
+    // Distance/proximity: only when distance information supports that distinction
+    const distInfo = track.distInfo;
+    let distText = '';
+    if (distInfo && !distInfo.uncertain && distInfo.source === 'relative-depth') {
+      if (distInfo.zone === 'danger') distText = ', close by';
+      else if (distInfo.zone === 'close') distText = ', nearby';
+      else if (distInfo.zone === 'far') distText = ', farther ahead';
+    }
+
+    // Motion
+    const mot = track.motion?.trajectory || track.motion;
+    let motText = '';
+    if (mot === 'approaching') motText = ', approaching';
+    else if (mot === 'crossing-left') motText = ', crossing left';
+    else if (mot === 'crossing-right') motText = ', crossing right';
+
+    return `${name} is ${posText}${distText}${motText}.`;
+  }
+
+  /* ═══════════════════════════════════════════════════════════════
      GUIDANCE — one prioritised scene message, never competing voices
   ═══════════════════════════════════════════════════════════════ */
+  const _announcedTrackHistory = new Map();
+
   function _announceScene(tracks, safeDir, videoWidth) {
-    if (!safeDir || !window.riskAPI?.shouldAnnounceDir?.(safeDir.direction, safeDir.hazard)) return;
+    if (!safeDir) return;
+
     const highest = tracks?.[0];
-    const highRisk = highest?.risk?.level === 'high';
     const hazard = safeDir.hazard;
     const hasHazard = Boolean(hazard?.type || hazard?.category);
     const hType = hazard?.category || hazard?.type;
     const hConf = hazard?.confidence;
     const isCriticalHazard = hasHazard && (hType === 'dropoff' || hType === 'stairs-down' || hType === 'uncovered-drain') && hConf === 'confident';
-    const isImmediateObstacle = highRisk && highest?.distInfo?.zone === 'danger';
-    const urgent = isCriticalHazard || isImmediateObstacle || highRisk || safeDir.direction === 'stop' || hasHazard;
-    const centre = highest ? (highest.bbox[0] + highest.bbox[2] / 2) / videoWidth : 0.5;
-    const side = centre < 0.38 ? 'on your left' : centre > 0.62 ? 'on your right' : 'ahead';
-    const approaching = highest?.motion?.trajectory === 'approaching';
+    const isImmediateObstacle = highest?.risk?.level === 'high' && highest?.distInfo?.zone === 'danger';
+    const urgent = isCriticalHazard || isImmediateObstacle || highest?.risk?.level === 'high' || safeDir.direction === 'stop' || hasHazard;
+
+    const dirAllowed = window.riskAPI?.shouldAnnounceDir?.(safeDir.direction, safeDir.hazard);
+    if (!dirAllowed && !urgent) return;
+
     let text = safeDir.speech;
-    // Prioritize imminent hazards over routine object descriptions
-    if (!hasHazard && highRisk && !text.toLowerCase().includes(highest.label)) {
-      text = `${_cap(highest.label)} ${side}${approaching ? ', approaching' : ''}. ${text}`;
+
+    // Prioritize imminent safety hazards over routine object descriptions
+    if (hasHazard) {
+      text = safeDir.speech;
+    } else if (highest) {
+      const now = Date.now();
+      const prev = _announcedTrackHistory.get(highest.id);
+      const isCooldownActive = prev && (now - prev.time < (GUIDE_CFG.objectCooldownMs || 8000));
+      const hasMeaningfulChange = !prev ||
+        prev.riskLevel !== highest.risk?.level ||
+        prev.motion !== highest.motion?.trajectory ||
+        prev.label !== highest.label;
+
+      if (!hasMeaningfulChange && isCooldownActive && !urgent) {
+        return; // Suppress duplicate announcement across frames
+      }
+
+      _announcedTrackHistory.set(highest.id, {
+        time: now,
+        riskLevel: highest.risk?.level,
+        motion: highest.motion?.trajectory,
+        label: highest.label
+      });
+
+      const objDesc = formatObjectDescription(highest, videoWidth);
+      const isUnknown = !highest.label || highest.label === 'unknown' || highest.label === 'obstacle';
+      const labelText = isUnknown ? 'unknown obstacle' : highest.label;
+
+      if (safeDir.direction === 'stop') {
+        text = `${objDesc} Please stop.`;
+      } else if (safeDir.speech && !safeDir.speech.toLowerCase().includes(labelText.toLowerCase())) {
+        text = `${objDesc} ${safeDir.speech}`;
+      } else {
+        text = safeDir.speech || objDesc;
+      }
     }
+
     const priority = (isCriticalHazard || isImmediateObstacle) ? 110 : (urgent ? 100 : (highest?.risk?.level === 'medium' || hasHazard) ? 85 : 30);
     const key = hasHazard
       ? `hazard:${hType}:${hConf || 'unknown'}:${safeDir.direction}`
       : urgent
       ? `risk:${highest?.id || 'scene'}:${highest?.risk?.level || 'blocked'}:${highest?.distInfo?.zone || 'unknown'}:${highest?.motion?.trajectory || 'unknown'}`
       : `direction:${safeDir.direction}:${highest?.risk?.level || 'clear'}`;
+
     window.riskAPI.markDirSent(safeDir.direction, safeDir.hazard);
     if (window.guidanceAPI) {
       window.guidanceAPI.announce(text, {
@@ -582,18 +680,49 @@
   /* A concise, on-demand scene description for the voice command layer. */
   function describeLatest() {
     const observation = window.sceneStateAPI?.getSnapshot?.();
-    if (!observation || observation.status !== 'active' || Date.now() - observation.timestamp > (CFG.staleAfterMs || 5000)) return '';
+    if (!observation) return 'The camera is off. Say start camera to analyse what is ahead.';
+    if (observation.status === 'degraded' || observation.status === 'error') {
+      return 'Live visual analysis is temporarily unavailable. Camera view may be obscured or lighting is too low. Please stop.';
+    }
+    if (observation.status !== 'active' || Date.now() - observation.timestamp > (CFG.staleAfterMs || 5000)) {
+      return 'The live scene analysis is updating. Hold steady while the view is assessed.';
+    }
+
+    // Critical hazard takes immediate precedence
+    if (observation.hazard && observation.hazard.type) {
+      const hLabel = observation.hazard.label || observation.hazard.alertMessage;
+      const hDesc = hLabel || (observation.hazard.type === 'dropoff' ? 'Drop-off detected ahead.' : 'Hazard detected ahead.');
+      return `${hDesc} Please stop and check your step.`;
+    }
+
     const objects = [...observation.objects].sort((a,b) => b.riskScore - a.riskScore);
     if (!objects.length) {
       return observation.guidanceMessage || 'No tracked obstacle is detected ahead. Continue carefully.';
     }
-    const descriptions = objects.slice(0,3).map(object => {
-      const side = object.position === 'left' ? 'on your left' : object.position === 'right' ? 'on your right' : 'ahead';
-      const movement = _motSpeech(object.motion);
-      return `${_cap(object.class)} ${side}, ${object.distanceLabel}${movement ? `, ${movement}` : ''}`;
+
+    const descriptions = objects.slice(0, 2).map(object => {
+      const trackLike = {
+        label: object.class,
+        bbox: object.bbox,
+        position: object.position,
+        distInfo: {
+          zone: object.distanceCategory,
+          label: object.distanceLabel,
+          source: object.distanceSource,
+          uncertain: object.distanceSource === 'size-heuristic'
+        },
+        motion: { trajectory: object.motion }
+      };
+      return formatObjectDescription(trackLike, observation.source?.width || 300);
     });
-    const guidance = observation.guidanceMessage ? ` ${observation.guidanceMessage}` : '';
-    return `${descriptions.join('. ')}.${guidance}`;
+
+    const combined = descriptions.join(' ');
+    const guidance = observation.recommendedDirection === 'stop'
+      ? ' Please stop.'
+      : observation.guidanceMessage && !descriptions.some(d => observation.guidanceMessage.toLowerCase().includes(d.toLowerCase()))
+      ? ` ${observation.guidanceMessage}`
+      : '';
+    return `${combined}${guidance}`.trim();
   }
 
 })();

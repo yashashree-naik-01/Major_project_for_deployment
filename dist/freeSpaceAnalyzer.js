@@ -115,6 +115,8 @@
             persistence: specialized.persistence,
             alertMessage: hazard.label || specialized.alertMessage
           };
+        } else if (specialized.riskLevel === 'critical' || specialized.riskLevel === 'high') {
+          hazard = specialized;
         } else if (!hazard.type.startsWith('stairs')) {
           hazard = specialized;
         }
@@ -122,8 +124,47 @@
     }
 
     const smoothedGrid = _smoothGrid(grid);
+
+    // Label each cell's traversability and uncertainty (Requirements 6 & 7)
+    smoothedGrid.forEach(cell => {
+      if (cell.status === 'obstacle') {
+        cell.traversable = 'obstacle';
+        cell.verifiedWalkable = false;
+        cell.uncertainty = 0.1;
+      } else if (cell.status === 'dropoff') {
+        cell.traversable = 'hazard';
+        cell.verifiedWalkable = false;
+        cell.uncertainty = 0.1;
+      } else if (cell.surfaceCategory === 'stairs' || cell.status === 'caution') {
+        cell.traversable = 'caution';
+        cell.verifiedWalkable = false;
+        cell.uncertainty = 0.4;
+      } else if (cell.surfaceCategory === 'road') {
+        cell.traversable = 'road';
+        cell.verifiedWalkable = false;
+        cell.uncertainty = 0.3;
+      } else if (cell.surfaceCategory === 'wall') {
+        cell.traversable = 'obstacle';
+        cell.verifiedWalkable = false;
+        cell.uncertainty = 0.1;
+      } else if (cell.depthGroundConfirmed || cell.surfaceGroundConfirmed) {
+        cell.traversable = 'walkable';
+        cell.verifiedWalkable = true;
+        cell.uncertainty = 0.15;
+      } else {
+        // Clear image region is NOT proof that the ground is walkable!
+        cell.traversable = 'unknown';
+        cell.verifiedWalkable = false;
+        cell.uncertainty = 0.85;
+      }
+    });
+
+    const nearMidCells = smoothedGrid.filter(c => c.r >= 1);
+    const hasAnyGroundEvidence = nearMidCells.some(c => c.verifiedWalkable || c.status === 'obstacle' || c.status === 'dropoff');
+    const surfaceUnassessed = !hasAnyGroundEvidence && (!dm || !dm.data);
+
     const advice = _computeAdvice(smoothedGrid, hazard);
-    return { grid: smoothedGrid, advice, hazard, surface: sm, COLS, ROWS };
+    return { grid: smoothedGrid, advice, hazard, surface: sm, surfaceUnassessed, COLS, ROWS };
   }
 
   /* ═══════════════════════════════════════════════════════════════
@@ -225,8 +266,14 @@
     const row2Values = grid.filter(c => c.r === 2).map(c => cellDepth[c.r * COLS + c.c]);
     const nearMax = Math.max(...row2Values);
     if (rowBaseline[1] && r2Base < rowBaseline[1]) {
-      const expectedSlope = Math.max(0, rowBaseline[1] - (rowBaseline[0] ?? rowBaseline[1]));
-      floorBaseline[2] = Math.max(nearMax, rowBaseline[1] + expectedSlope);
+      if (nearMax - r2Base >= 0.12 * range) {
+        floorBaseline[2] = nearMax;
+      } else if (r2Base < dm.sceneMin + 0.25 * range) {
+        const expectedSlope = Math.max(0, rowBaseline[1] - (rowBaseline[0] ?? rowBaseline[1]));
+        floorBaseline[2] = Math.min(dm.sceneMax ?? 1, Math.max(nearMax, rowBaseline[1] + expectedSlope));
+      } else {
+        floorBaseline[2] = r2Base;
+      }
     } else if (r2Base < nearMax - 0.18 * range && nearMax >= dm.sceneMin + 0.40 * range) {
       floorBaseline[2] = nearMax;
     } else {
@@ -315,6 +362,16 @@
       }
     }
 
+    // Evaluate ground confirmation for each cell against floor baseline
+    grid.forEach((cell, index) => {
+      if (cell.status === 'obstacle' || cell.status === 'dropoff') {
+        cell.depthGroundConfirmed = false;
+        return;
+      }
+      const deltaFromBaseline = Math.abs(cellDepth[index] - floorBaseline[cell.r]) / range;
+      cell.depthGroundConfirmed = deltaFromBaseline < (CFG.depthGroundTolerance ?? 0.14);
+    });
+
     let hazard = null;
 
     // ── Hazard Classification: Descending Stairs, Drop-off, Ascending Stairs ──
@@ -325,9 +382,9 @@
     const midElevation = (centerMid - expectedCenterMid) / range;
 
     const stairDown = _detectDownwardStairs(dm, dropCells, grid, dw, dh, range);
-    const upward = _detectUpwardStairs(dm, grid, dw, dh, rowBaseline, range);
+    const upward = _detectUpwardStairs(dm, grid, rowBaseline, dh, rowBaseline, range);
 
-    if (midElevation >= 0.08 && upward.isStairs) {
+    if (dropCells.length === 0 && midElevation >= 0.08 && upward.isStairs) {
       // Confirmed Ascending Stairs: mid ground is elevated above linear ground continuation
       const isAmbiguous = Boolean(upward.isAmbiguous);
       const hazardType = isAmbiguous ? 'stairs-ambiguous' : 'stairs-up';
@@ -494,6 +551,12 @@
       // ── 4. Footpath / Sidewalk (CRITICAL SAFETY RULE) ─────────────
       // Sidewalk or footpath alone NEVER overrides an obstacle or drop-off!
       // If cell.status is 'obstacle' or 'dropoff', we keep it strictly intact.
+      if (shares.footpath >= 0.35 || match.primaryCategory === 'footpath' ||
+          shares.floor >= 0.35 || match.primaryCategory === 'floor') {
+        cell.surfaceGroundConfirmed = true;
+      } else {
+        cell.surfaceGroundConfirmed = false;
+      }
     });
 
     // ── Fuse Semantic Stairs Evidence with Depth Hazards ──────────
@@ -568,29 +631,47 @@
     const yStart = Math.floor(dh * 0.35);
     const yEnd   = Math.floor(dh * 0.95);
     const stepY  = Math.max(1, Math.floor(dh / 60));
+    const tiltWindow = Math.max(2, Math.floor(dh / 30));
 
     const detectedEdges = [];
     let lastEdgeY = -100;
-    const minEdgeSeparation = Math.max(3, Math.floor(dh / 18));
+    const minEdgeSeparation = Math.max(5, Math.floor(dh / 10));
 
     for (let y = yStart; y < yEnd - stepY; y += stepY) {
-      let matchingColumns = 0;
-      for (const x of xPositions) {
-        const idx1 = y * dw + x;
-        const idx2 = (y + stepY) * dw + x;
-        const val1 = data[idx1];
-        const val2 = data[idx2];
-        if (Number.isFinite(val1) && Number.isFinite(val2)) {
-          if (Math.abs(val1 - val2) >= threshold) {
-            matchingColumns++;
-          }
-        }
+      if (y - lastEdgeY < minEdgeSeparation) continue;
+
+      const xc = xPositions[1];
+      const c1 = data[y * dw + xc];
+      const c2 = data[(y + stepY) * dw + xc];
+      const c3 = data[Math.min(dh - 1, y + stepY * 2) * dw + xc];
+      const centerEdge = (Number.isFinite(c1) && Number.isFinite(c2) && Math.abs(c1 - c2) >= threshold) ||
+                         (Number.isFinite(c1) && Number.isFinite(c3) && Math.abs(c1 - c3) >= threshold);
+
+      if (!centerEdge) {
+        const l1 = data[y * dw + xPositions[0]], l2 = data[(y + stepY) * dw + xPositions[0]];
+        const r1 = data[y * dw + xPositions[2]], r2 = data[(y + stepY) * dw + xPositions[2]];
+        const sideDirect = Number.isFinite(l1) && Number.isFinite(l2) && Math.abs(l1 - l2) >= threshold &&
+                           Number.isFinite(r1) && Number.isFinite(r2) && Math.abs(r1 - r2) >= threshold;
+        if (!sideDirect) continue;
       }
 
-      // If at least 2 of 3 columns show a step edge at this Y, it is a horizontal step edge
-      if (matchingColumns >= 2 && (y - lastEdgeY >= minEdgeSeparation)) {
+      let matchingColumns = 1;
+      for (const colX of [xPositions[0], xPositions[2]]) {
+        let sideHasEdge = false;
+        for (let ty = Math.max(yStart, y - tiltWindow); ty <= Math.min(yEnd - stepY, y + tiltWindow); ty += stepY) {
+          const tv1 = data[ty * dw + colX];
+          const tv2 = data[(ty + stepY) * dw + colX];
+          if (Number.isFinite(tv1) && Number.isFinite(tv2) && Math.abs(tv1 - tv2) >= threshold * 0.85) {
+            sideHasEdge = true;
+            break;
+          }
+        }
+        if (sideHasEdge) matchingColumns++;
+      }
+
+      if (matchingColumns >= 2) {
         detectedEdges.push({ y, strength: matchingColumns });
-        lastEdgeY = y;
+        lastEdgeY = y + tiltWindow;
       }
     }
 
@@ -624,14 +705,14 @@
       data = dataOrDm.data;
       dw = dataOrDm.width;
       dh = dataOrDm.height;
-      grid = gridOrDw;
-      rowBaseline = dhOrBase;
+      grid = Array.isArray(gridOrDw) ? gridOrDw : [];
+      rowBaseline = Array.isArray(dhOrBase) ? dhOrBase : (Array.isArray(maybeBase) ? maybeBase : []);
       range = Math.max(1e-6, (dataOrDm.sceneMax ?? 1) - (dataOrDm.sceneMin ?? 0));
     } else {
       data = dataOrDm;
       dw = gridOrDw;
       dh = maybeDh || dhOrBase;
-      grid = maybeBase || [];
+      grid = Array.isArray(maybeBase) ? maybeBase : [];
       range = maybeRange || 1;
       rowBaseline = [];
     }
@@ -650,28 +731,47 @@
     const yStart = Math.floor(dh * 0.20);
     const yEnd   = Math.floor(dh * 0.85);
     const stepY  = Math.max(1, Math.floor(dh / 60));
+    const tiltWindow = Math.max(2, Math.floor(dh / 30));
 
     const detectedRisers = [];
     let lastRiserY = -100;
-    const minRiserSeparation = Math.max(3, Math.floor(dh / 18));
+    const minRiserSeparation = Math.max(5, Math.floor(dh / 10));
 
     for (let y = yStart; y < yEnd - stepY; y += stepY) {
-      let matchingColumns = 0;
-      for (const x of xPositions) {
-        const idx1 = y * dw + x;
-        const idx2 = (y + stepY) * dw + x;
-        const val1 = data[idx1];
-        const val2 = data[idx2];
-        if (Number.isFinite(val1) && Number.isFinite(val2)) {
-          if (Math.abs(val1 - val2) >= threshold) {
-            matchingColumns++;
-          }
-        }
+      if (y - lastRiserY < minRiserSeparation) continue;
+
+      const xc = xPositions[1];
+      const c1 = data[y * dw + xc];
+      const c2 = data[(y + stepY) * dw + xc];
+      const c3 = data[Math.min(dh - 1, y + stepY * 2) * dw + xc];
+      const centerEdge = (Number.isFinite(c1) && Number.isFinite(c2) && Math.abs(c1 - c2) >= threshold) ||
+                         (Number.isFinite(c1) && Number.isFinite(c3) && Math.abs(c1 - c3) >= threshold);
+
+      if (!centerEdge) {
+        const l1 = data[y * dw + xPositions[0]], l2 = data[(y + stepY) * dw + xPositions[0]];
+        const r1 = data[y * dw + xPositions[2]], r2 = data[(y + stepY) * dw + xPositions[2]];
+        const sideDirect = Number.isFinite(l1) && Number.isFinite(l2) && Math.abs(l1 - l2) >= threshold &&
+                           Number.isFinite(r1) && Number.isFinite(r2) && Math.abs(r1 - r2) >= threshold;
+        if (!sideDirect) continue;
       }
 
-      if (matchingColumns >= 2 && (y - lastRiserY >= minRiserSeparation)) {
+      let matchingColumns = 1;
+      for (const colX of [xPositions[0], xPositions[2]]) {
+        let sideHasEdge = false;
+        for (let ty = Math.max(yStart, y - tiltWindow); ty <= Math.min(yEnd - stepY, y + tiltWindow); ty += stepY) {
+          const tv1 = data[ty * dw + colX];
+          const tv2 = data[(ty + stepY) * dw + colX];
+          if (Number.isFinite(tv1) && Number.isFinite(tv2) && Math.abs(tv1 - tv2) >= threshold * 0.85) {
+            sideHasEdge = true;
+            break;
+          }
+        }
+        if (sideHasEdge) matchingColumns++;
+      }
+
+      if (matchingColumns >= 2) {
         detectedRisers.push({ y, strength: matchingColumns });
-        lastRiserY = y;
+        lastRiserY = y + tiltWindow;
       }
     }
 
@@ -773,18 +873,17 @@
 
       if (hazard.type === 'dropoff') {
         if (hazard.confidence === 'uncertain') {
-          // PROMPT REQUIREMENT: Say "Possible drop-off ahead" when confidence is uncertain
-          speech = 'Possible drop-off ahead. Proceed with caution.';
+          speech = 'Possible drop-off ahead. Stop.';
           summary = 'Possible drop-off';
-          direction = 'slow';
+          direction = 'stop';
         } else {
           speech = 'Drop-off detected ahead. Stop and check your step.';
           summary = 'Drop-off ahead';
           direction = 'stop';
         }
         if (!cClear) {
-          if (lClear && !rClear) speech += ' The left side appears clearer.';
-          else if (!lClear && rClear) speech += ' The right side appears clearer.';
+          if (lClear && !rClear) speech = `${speech.replace(/\s*Stop\.?/i, '')} The area to your left appears clearer, but the route is not fully verified.`;
+          else if (!lClear && rClear) speech = `${speech.replace(/\s*Stop\.?/i, '')} The area to your right appears clearer, but the route is not fully verified.`;
         }
         return { speech, summary, direction, lClear, cClear, rClear, hazard };
       }
@@ -919,7 +1018,7 @@
     } else if (!cClear && !lClear && !rClear) {
       summary   = 'Blocked';
       direction = 'stop';
-      speech    = 'Path blocked on all sides. Please stop and look around carefully.';
+      speech    = 'Path blocked on all sides. Please stop.';
 
     } else {
       summary   = 'Caution';

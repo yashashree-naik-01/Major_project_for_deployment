@@ -51,6 +51,7 @@
   /* ─── Public API ─────────────────────────────────────────────── */
   window.hazardDetectorAPI = {
     detectHazards,
+    detectStairs,
     detectPotholes,
     detectUncoveredDrains,
     detectCurbs,
@@ -96,7 +97,11 @@
     const drainHazards = detectUncoveredDrains(grid, depthMap, surfaceMap, floorBaseline, range, vw, vh);
     allHazards.push(...drainHazards);
 
-    // 2. Detect Potholes (High severity)
+    // 2. Detect Stairs (Critical severity for stairs-down, High for stairs-up)
+    const stairHazards = detectStairs(grid, depthMap, surfaceMap, tracks, floorBaseline, range, vw, vh);
+    allHazards.push(...stairHazards);
+
+    // 3. Detect Potholes (High severity)
     const potholeHazards = detectPotholes(grid, depthMap, surfaceMap, tracks, floorBaseline, range, vw, vh);
     allHazards.push(...potholeHazards);
 
@@ -522,6 +527,255 @@
   }
 
   /* ═══════════════════════════════════════════════════════════════
+     CATEGORY 6: STAIRS & STEP HAZARDS (Ascending & Descending)
+     Characteristics:
+       • Multi-modal fusion: Corridor depth profile P(y), periodic
+         riser step edges, tread plateaus, horizontal Sobel dominance.
+       • Distinguishes descending stairs (void treads dropping below
+         ground baseline) from ascending stairs (risers elevating
+         above flat floor continuation).
+       • Discriminates ambiguous step-like structures with cautious
+         alerting ("Possible stairs ahead. Stop and check before proceeding.")
+       • Rejects continuous ramps, flat checkerboard floors, shadows,
+         and side handrails.
+       • Masks out dynamic obstacles (pedestrians) so they are not
+         confused with stair structure.
+  ═══════════════════════════════════════════════════════════════ */
+  function detectStairs(grid, depthMap, surfaceMap, tracks, floorBaseline, range, vw, vh) {
+    const results = [];
+    if (!depthMap || !depthMap.data || !range || range < MIN_RELIABLE_RANGE) return results;
+
+    const { data, width: dw, height: dh } = depthMap;
+    if (!dw || !dh || !data.length) return results;
+
+    // 1. Build obstacle exclusion mask from ByteTrack tracks
+    // (Ensure standing persons or objects on steps do not corrupt stair riser detection)
+    const obstacleMask = new Uint8Array(dw * dh);
+    if (Array.isArray(tracks)) {
+      for (const tr of tracks) {
+        if (!tr.bbox || tr.bbox.length < 4) continue;
+        const [bx, by, bw, bh] = tr.bbox;
+        const x0 = Math.max(0, Math.floor((bx / vw) * dw));
+        const x1 = Math.min(dw - 1, Math.floor(((bx + bw) / vw) * dw));
+        const y0 = Math.max(0, Math.floor((by / vh) * dh));
+        const y1 = Math.min(dh - 1, Math.floor(((by + bh) / vh) * dh));
+        for (let my = y0; my <= y1; my++) {
+          const rowOffset = my * dw;
+          for (let mx = x0; mx <= x1; mx++) {
+            obstacleMask[rowOffset + mx] = 1;
+          }
+        }
+      }
+    }
+
+    // 2. Walking corridor bounds (x: 25% to 75%, y: 20% to 95%)
+    const xMin = Math.floor(dw * 0.25);
+    const xMax = Math.floor(dw * 0.75);
+    const yMin = Math.floor(dh * 0.20);
+    const yMax = Math.floor(dh * 0.95);
+    const stepY = Math.max(2, Math.floor(dh / 60));
+
+    // 3. Compute row-wise corridor median depth profile P(y)
+    const profile = new Float32Array(dh);
+    const validRows = new Uint8Array(dh);
+    for (let y = yMin; y <= yMax; y++) {
+      const vals = [];
+      const stepX = Math.max(1, Math.floor((xMax - xMin) / 12));
+      const rowOffset = y * dw;
+      for (let x = xMin; x <= xMax; x += stepX) {
+        if (obstacleMask[rowOffset + x]) continue; // Ignore obstacle pixels
+        const v = data[rowOffset + x];
+        if (Number.isFinite(v)) vals.push(v);
+      }
+      if (vals.length >= 3) {
+        vals.sort((a, b) => a - b);
+        profile[y] = vals[Math.floor(vals.length / 2)];
+        validRows[y] = 1;
+      }
+    }
+
+    // 4. Directional gradient energy check: Horizontal (Sobel Y) vs Vertical (Sobel X)
+    // True stairs have dominant horizontal step risers across corridor
+    let sumGradY = 0;
+    let sumGradX = 0;
+    const sampleStep = Math.max(2, Math.floor(dh / 40));
+    for (let y = yMin + sampleStep; y < yMax - sampleStep; y += sampleStep) {
+      for (let x = xMin + sampleStep; x < xMax - sampleStep; x += sampleStep) {
+        if (obstacleMask[y * dw + x]) continue;
+        const gy = Math.abs(data[(y + sampleStep) * dw + x] - data[(y - sampleStep) * dw + x]);
+        const gx = Math.abs(data[y * dw + (x + sampleStep)] - data[y * dw + (x - sampleStep)]);
+        if (Number.isFinite(gy) && Number.isFinite(gx)) {
+          sumGradY += gy;
+          sumGradX += gx;
+        }
+      }
+    }
+    const gradRatio = (sumGradY + 1e-5) / (sumGradX + 1e-5);
+    const hasHorizontalDominance = gradRatio >= 1.20;
+
+    // 5. Detect periodic step risers via finite differences
+    const threshold = (CFG.stairEdgeThreshold ?? 0.075) * range;
+    const detectedRisers = [];
+    const minRiserSep = Math.max(3, Math.floor(dh / 20));
+    let lastRiserY = -100;
+
+    // Multi-column tilt-tolerant edge detection
+    const colLeft = Math.floor(dw * 0.35);
+    const colCenter = Math.floor(dw * 0.50);
+    const colRight = Math.floor(dw * 0.65);
+    const tiltWindow = Math.max(3, Math.floor(dh / 25));
+
+    for (let y = yMin; y < yMax - (stepY * 2); y += stepY) {
+      if (!validRows[y] || !validRows[y + stepY]) continue;
+      const gradCenter = Math.abs(profile[y] - profile[y + stepY]);
+      const gradSpan = Math.abs(profile[y] - profile[Math.min(yMax, y + stepY * 2)]);
+      const maxGrad = Math.max(gradCenter, gradSpan);
+
+      if (maxGrad >= threshold) {
+        // Cross-column confirmation with tilt tolerance
+        let matchingCols = 0;
+        for (const colX of [colLeft, colCenter, colRight]) {
+          let colHasEdge = false;
+          for (let ty = Math.max(yMin, y - tiltWindow); ty <= Math.min(yMax - stepY, y + tiltWindow); ty += stepY) {
+            const v1 = data[ty * dw + colX];
+            const v2 = data[(ty + stepY) * dw + colX];
+            if (Number.isFinite(v1) && Number.isFinite(v2) && Math.abs(v1 - v2) >= threshold * 0.85) {
+              colHasEdge = true;
+              break;
+            }
+          }
+          if (colHasEdge) matchingCols++;
+        }
+
+        if (matchingCols >= 2 && (y - lastRiserY >= minRiserSep)) {
+          const isDownward = profile[y] < profile[y + stepY];
+          detectedRisers.push({ y, strength: matchingCols, maxGrad, isDownward });
+          lastRiserY = y;
+        }
+      }
+    }
+
+    // 6. Continuous ramp rejection:
+    // A continuous ramp has near-constant gradient everywhere (no discrete peaks separated by flat treads)
+    if (detectedRisers.length >= 2) {
+      const gradVals = [];
+      for (let y = yMin; y < yMax - stepY; y += stepY) {
+        if (validRows[y] && validRows[y + stepY]) {
+          gradVals.push(Math.abs(profile[y] - profile[y + stepY]));
+        }
+      }
+      if (gradVals.length > 5) {
+        const meanGrad = gradVals.reduce((a, b) => a + b, 0) / gradVals.length;
+        const maxGrad = Math.max(...gradVals);
+        // On a continuous ramp, maxGrad / meanGrad < 1.70 with low peak variance
+        if (maxGrad / (meanGrad + 1e-6) < 1.65 && !hasHorizontalDominance) {
+          return results; // Continuous ramp rejected
+        }
+      }
+    }
+
+    // 7. Check SegFormer semantic segmentation confirmation
+    let hasSemanticStairs = false;
+    let semanticStairShare = 0;
+    if (surfaceMap?.cells && Array.isArray(surfaceMap.cells)) {
+      for (const sc of surfaceMap.cells) {
+        if (sc.c >= 1 && sc.c <= 3 && sc.r >= 1) {
+          if (sc.primaryCategory === 'stairs' || (sc.shares?.stairs && sc.shares.stairs >= 0.20)) {
+            hasSemanticStairs = true;
+            semanticStairShare = Math.max(semanticStairShare, sc.shares?.stairs || 0.35);
+          }
+        }
+      }
+    }
+
+    const minEdges = CFG.stairEdgeMinCount ?? 2;
+    if (detectedRisers.length < minEdges && !hasSemanticStairs) {
+      return results;
+    }
+
+    // 8. Distinguish Ascending vs Descending vs Ambiguous
+    // In relative inverse depth (disparity):
+    // Descending stairs drop down away from camera: floor drops below baseline (negative disparity deviation)
+    // Ascending stairs climb up towards upper half of frame: mid ground is elevated closer to camera
+    const yMidStart = Math.floor(dh * 0.35);
+    const yMidEnd   = Math.floor(dh * 0.65);
+    let midSum = 0, midCount = 0;
+    for (let y = yMidStart; y < yMidEnd; y++) {
+      if (validRows[y]) {
+        midSum += profile[y];
+        midCount++;
+      }
+    }
+    const midAvg = midCount > 0 ? (midSum / midCount) : 0.5;
+
+    const expectedMid = (floorBaseline && Number.isFinite(floorBaseline[0]) && Number.isFinite(floorBaseline[2]))
+      ? (floorBaseline[0] + floorBaseline[2]) / 2
+      : (validRows[Math.floor(dh * 0.25)] ?? 0.35) * 0.5 + (validRows[Math.floor(dh * 0.85)] ?? 0.80) * 0.5;
+    const elevation = (midAvg - expectedMid) / range;
+
+    // Check downward drop-offs from grid or profile
+    const dropCells = grid.filter(c => (c.r === 1 || c.r === 2) && c.c >= 1 && c.c <= 3 && c.status === 'dropoff');
+    const isDescending = dropCells.length >= 1 || elevation <= -0.05;
+    const isAscending  = elevation >= 0.05 && !isDescending;
+
+    let category = 'stairs-ambiguous';
+    let riskLevel = 'medium';
+    let alertMessageConfident = 'Possible stairs ahead. Stop and check before proceeding.';
+    let alertMessageUncertain = 'Possible stairs ahead. Stop and check before proceeding.';
+
+    if (isDescending) {
+      category = 'stairs-down';
+      riskLevel = 'critical';
+      alertMessageConfident = 'Descending stairs ahead. Stop and check your step.';
+      alertMessageUncertain = 'Possible descending stairs ahead. Stop and check.';
+    } else if (isAscending) {
+      category = 'stairs-up';
+      riskLevel = 'high';
+      alertMessageConfident = 'Stairs ahead leading up. Approach carefully.';
+      alertMessageUncertain = 'Possible steps ahead. Approach cautiously.';
+    }
+
+    const isConfident = hasSemanticStairs || (detectedRisers.length >= 3 && hasHorizontalDominance) || (detectedRisers.length >= 2 && Math.abs(elevation) >= 0.12);
+    const confidence = isConfident ? 'confident' : 'uncertain';
+    const uncertainty = isConfident ? 0.15 : 0.45;
+
+    const firstY = detectedRisers[0]?.y ?? Math.floor(dh * 0.40);
+    const lastY = detectedRisers[detectedRisers.length - 1]?.y ?? Math.floor(dh * 0.75);
+    const isNear = lastY > dh * 0.65 || dropCells.some(c => c.r === 2);
+
+    const affectedGridCells = grid.filter(c => (c.r === 1 || c.r === 2) && c.c >= 1 && c.c <= 3);
+    affectedGridCells.forEach(cell => {
+      if (cell.status === 'clear') {
+        cell.status = isDescending ? 'dropoff' : 'caution';
+        cell.zone = isNear ? 'danger' : 'medium';
+        cell.src = 'hazard-stairs';
+      }
+    });
+
+    const hazardResult = _buildHazardResult({
+      category,
+      confidence,
+      riskLevel,
+      side: 'center',
+      row: isNear ? 'near' : 'mid',
+      proximity: isNear ? 'immediate' : 'close',
+      cells: affectedGridCells,
+      delta: Math.max(...detectedRisers.map(r => r.maxGrad), Math.abs(elevation) * range),
+      vw, vh,
+      alertMessageConfident,
+      alertMessageUncertain
+    });
+
+    hazardResult.edgeCount = detectedRisers.length;
+    hazardResult.uncertainty = uncertainty;
+    hazardResult.hasHorizontalDominance = hasHorizontalDominance;
+    hazardResult.surfaceConfirmed = hasSemanticStairs;
+
+    results.push(hazardResult);
+    return results;
+  }
+
+  /* ═══════════════════════════════════════════════════════════════
      RESULT BUILDER & PROXIMITY RULES
   ═══════════════════════════════════════════════════════════════ */
   function _buildHazardResult(opts) {
@@ -663,12 +917,20 @@
     const stepY = Math.max(1, Math.floor((y1 - y0) / 6));
 
     for (let y = y0; y < y1; y += stepY) {
+      let rowSum = 0, rowCount = 0;
       for (let x = x0; x < x1; x += stepX) {
         const val = data[y * dw + x];
-        if (Number.isFinite(val)) {
-          const diff = val - mean;
-          sumSq += diff * diff;
-          count++;
+        if (Number.isFinite(val)) { rowSum += val; rowCount++; }
+      }
+      if (rowCount > 1) {
+        const rowMean = rowSum / rowCount;
+        for (let x = x0; x < x1; x += stepX) {
+          const val = data[y * dw + x];
+          if (Number.isFinite(val)) {
+            const diff = val - rowMean;
+            sumSq += diff * diff;
+            count++;
+          }
         }
       }
     }
