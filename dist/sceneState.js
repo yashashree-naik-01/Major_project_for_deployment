@@ -18,7 +18,8 @@
       guidanceMessage: '',
       processingMs: 0,
       source: Object.freeze({ width: 0, height: 0 }),
-      depth: Object.freeze({ available: false, ageMs: null, relative: true })
+      depth: Object.freeze({ available: false, ageMs: null, relative: true }),
+      surface: Object.freeze({ available: false, ageMs: null, primaryCategory: 'unknown', shares: null, device: 'none' })
     });
   }
 
@@ -63,6 +64,30 @@
       right: _zone(zones.right)
     });
     const depthAge = window.depthAPI?.getDepthAge?.();
+    const surfaceMap = input.surface || input.freeSpace?.surface || window.surfaceSegmentationAPI?.getSurfaceMap?.() || null;
+    const surfaceAge = window.surfaceSegmentationAPI?.getSurfaceAge?.();
+    const frozenSurface = surfaceMap ? Object.freeze({
+      available: true,
+      ageMs: Number.isFinite(surfaceAge) ? Math.round(surfaceAge) : null,
+      primaryCategory: surfaceMap.zones?.center?.primaryCategory || 'unknown',
+      shares: surfaceMap.overallShares ? Object.freeze({ ...surfaceMap.overallShares }) : null,
+      device: surfaceMap.device || 'none'
+    }) : Object.freeze({ available: false, ageMs: null, primaryCategory: 'unknown', shares: null, device: 'none' });
+    const hazard = input.freeSpace?.hazard || input.safeDir?.hazard || input.hazard || null;
+    const frozenHazard = hazard && (hazard.type || hazard.category) ? Object.freeze({
+      type: hazard.type || hazard.category,
+      category: hazard.category || hazard.type,
+      confidence: hazard.confidence || 'none',
+      label: hazard.label || hazard.alertMessage || '',
+      alertMessage: hazard.alertMessage || hazard.label || '',
+      riskLevel: hazard.riskLevel || 'medium',
+      proximity: hazard.proximity || null,
+      persistence: Number(hazard.persistence ?? hazard.consecutiveFrames ?? 1),
+      edgeCount: Number(hazard.edgeCount) || 0,
+      delta: Number(hazard.delta) || 0,
+      location: hazard.location ? Object.freeze({ ...hazard.location }) : null,
+      surfaceConfirmed: Boolean(hazard.surfaceConfirmed)
+    }) : null;
     state = Object.freeze({
       sessionId,
       frameId: Number(input.frameId) || state.frameId + 1,
@@ -71,6 +96,7 @@
       error: null,
       objects: Object.freeze(objects),
       freeSpace,
+      hazard: frozenHazard,
       recommendedDirection: input.safeDir?.direction || null,
       guidanceMessage: input.safeDir?.speech || input.freeSpace?.advice?.speech || '',
       processingMs: Math.max(0, Math.round(Number(input.processingMs) || 0)),
@@ -79,7 +105,8 @@
         available: Number.isFinite(depthAge),
         ageMs: Number.isFinite(depthAge) ? Math.round(depthAge) : null,
         relative: true
-      })
+      }),
+      surface: frozenSurface
     });
     _notify();
     return state;

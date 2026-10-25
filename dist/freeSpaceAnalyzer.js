@@ -32,6 +32,15 @@
   // Detected bbox must cover ≥ this fraction of a cell to mark it obstacle
   const DET_OVERLAP  = CFG.detectionOverlap ?? 0.20;
   let _smoothedCells = [];
+  let _lastFloorBaseline = null;
+  let _lastRange = 1;
+  let _hazardTracker = {
+    type: null,
+    confidence: 'none',
+    consecutiveFrames: 0,
+    lastSeen: 0,
+    maxDelta: 0
+  };
 
   /* ─── Announcement throttle ──────────────────────────────────── */
   let _prevSig       = '';
@@ -45,7 +54,19 @@
     drawOverlay,
     shouldAnnounce,
     markSent,
-    reset: () => { _smoothedCells = []; _prevSig = ''; _prevSigTime = 0; },
+    detectDownwardStairs: _detectDownwardStairs,
+    detectUpwardStairs: _detectUpwardStairs,
+    applySurfaces: _applySurfaces,
+    reset: () => {
+      _smoothedCells = [];
+      _gridPool = null;
+      _prevSig = '';
+      _prevSigTime = 0;
+      _lastFloorBaseline = null;
+      _lastRange = 1;
+      _hazardTracker = { type: null, confidence: 'none', consecutiveFrames: 0, lastSeen: 0, maxDelta: 0 };
+      if (window.hazardDetectorAPI?.reset) window.hazardDetectorAPI.reset();
+    },
   };
 
   /* ═══════════════════════════════════════════════════════════════
@@ -54,7 +75,7 @@
   /**
    * @param {HTMLVideoElement} videoEl  — live camera video
    * @param {Array}            tracks   — enriched ByteTrack output
-   * @returns {{ grid, advice, COLS, ROWS }} | null
+   * @returns {{ grid, advice, hazard, surface, COLS, ROWS }} | null
    */
   function analyze(videoEl, tracks) {
     if (!videoEl || videoEl.videoWidth === 0) return null;
@@ -68,34 +89,80 @@
     if (tracks && tracks.length) _applyDetections(grid, tracks, vw, vh);
 
     // ── Source 2: Depth-Anything-V2 floor deviation ───────────────
+    let hazard = null;
     const dm = window.depthAPI?.getDepthMap?.();
-    if (dm && dm.data) _applyDepth(grid, dm, vw, vh);
+    if (dm && dm.data) hazard = _applyDepth(grid, dm, vw, vh);
+
+    // ── Source 3: Surface Segmentation ────────────────────────────
+    const sm = window.surfaceSegmentationAPI?.getSurfaceMap?.();
+    if (sm) hazard = _applySurfaces(grid, sm, vw, vh, hazard);
+
+    // ── Source 4: Specialized Hazard Detection Engine ─────────────
+    if (window.hazardDetectorAPI && dm && dm.data) {
+      const specialized = window.hazardDetectorAPI.detectHazards({
+        grid, depthMap: dm, surfaceMap: sm, tracks, vw, vh,
+        floorBaseline: _lastFloorBaseline, range: _lastRange
+      });
+      if (specialized) {
+        if (!hazard) {
+          hazard = specialized;
+        } else if (hazard.type === 'dropoff') {
+          hazard = {
+            ...hazard,
+            category: specialized.category,
+            proximity: specialized.proximity,
+            riskLevel: specialized.riskLevel || 'high',
+            persistence: specialized.persistence,
+            alertMessage: hazard.label || specialized.alertMessage
+          };
+        } else if (!hazard.type.startsWith('stairs')) {
+          hazard = specialized;
+        }
+      }
+    }
 
     const smoothedGrid = _smoothGrid(grid);
-    const advice = _computeAdvice(smoothedGrid);
-    return { grid: smoothedGrid, advice, COLS, ROWS };
+    const advice = _computeAdvice(smoothedGrid, hazard);
+    return { grid: smoothedGrid, advice, hazard, surface: sm, COLS, ROWS };
   }
 
   /* ═══════════════════════════════════════════════════════════════
      GRID CONSTRUCTION
   ═══════════════════════════════════════════════════════════════ */
+  let _gridPool = null;
   function _buildGrid(vw, vh) {
-    const cells = [];
-    for (let r = 0; r < ROWS; r++) {
-      for (let c = 0; c < COLS; c++) {
-        cells.push({
+    const total = ROWS * COLS;
+    if (!_gridPool || _gridPool.length !== total) {
+      _gridPool = new Array(total);
+      for (let i = 0; i < total; i++) {
+        const r = Math.floor(i / COLS);
+        const c = i % COLS;
+        _gridPool[i] = {
           r, c,
-          x: (c / COLS) * vw,  y: (r / ROWS) * vh,
-          w: vw / COLS,        h: vh / ROWS,
-          status: 'clear',    // 'clear' | 'caution' | 'obstacle'
-          zone:   null,        // 'danger' | 'close' | 'medium' | 'far'
-          src:    null,        // 'det' | 'depth'
-          label:  null,
-          trackId: null,
-        });
+          x: 0, y: 0, w: 0, h: 0,
+          status: 'clear', zone: null, src: null, label: null, trackId: null,
+          surfaceCategory: 'unknown', surfaceConfidence: 0, surfaceShares: null
+        };
       }
     }
-    return cells;
+    const cellW = vw / COLS;
+    const cellH = vh / ROWS;
+    for (let i = 0; i < total; i++) {
+      const cell = _gridPool[i];
+      cell.x = cell.c * cellW;
+      cell.y = cell.r * cellH;
+      cell.w = cellW;
+      cell.h = cellH;
+      cell.status = 'clear';
+      cell.zone = null;
+      cell.src = null;
+      cell.label = null;
+      cell.trackId = null;
+      cell.surfaceCategory = 'unknown';
+      cell.surfaceConfidence = 0;
+      cell.surfaceShares = null;
+    }
+    return _gridPool;
   }
 
   /* ═══════════════════════════════════════════════════════════════
@@ -129,25 +196,61 @@
   }
 
   /* ═══════════════════════════════════════════════════════════════
-     SOURCE 2 — Depth-based floor deviation
-     The ground plane in a forward-facing camera has a characteristic
-     depth gradient. Anything significantly CLOSER than the local
-     floor baseline is an elevated object = obstacle.
+     SOURCE 2 — Depth-based floor deviation & ground hazards
+     1. Positive obstacles (elevated floor protrusions)
+     2. Drop-off detection (ground discontinuities / downward edges)
+     3. Downward-stair detection (testing horizontal stair edges)
+     4. Upward-stair detection (step-pattern gradient analysis)
   ═══════════════════════════════════════════════════════════════ */
   function _applyDepth(grid, dm, vw, vh) {
     const { data, width: dw, height: dh } = dm;
     const range = dm.sceneMax - dm.sceneMin;
-    if (!data?.length || !dw || !dh || range < 1e-6) return;
+    if (!data?.length || !dw || !dh || range < 1e-6) return null;
 
     // Depth Anything supplies relative inverse depth (larger = closer). Compare
-    // each cell with peers in the same image row; this avoids claiming that the
-    // bottom of an arbitrarily aimed camera is guaranteed to be floor.
+    // each cell with peers and uncorrupted floor baselines.
     const cellDepth = grid.map(cell => _cellMedian(data, dw, dh, cell));
     const rowBaseline = Array.from({ length: ROWS }, (_, row) => {
       const values = grid.filter(cell => cell.r === row).map(cell => cellDepth[cell.r * COLS + cell.c]);
       return _median(values);
     });
 
+    // Robust floor baseline calculation:
+    // rowBaseline[r] is the lateral median across the 5 cells in row r.
+    // If the floor collapses across multiple walking cells in row 2 or row 1:
+    const floorBaseline = new Array(ROWS);
+
+    // Row 2 (nearest walking ground)
+    const r2Base = rowBaseline[2];
+    const row2Values = grid.filter(c => c.r === 2).map(c => cellDepth[c.r * COLS + c.c]);
+    const nearMax = Math.max(...row2Values);
+    if (rowBaseline[1] && r2Base < rowBaseline[1]) {
+      const expectedSlope = Math.max(0, rowBaseline[1] - (rowBaseline[0] ?? rowBaseline[1]));
+      floorBaseline[2] = Math.max(nearMax, rowBaseline[1] + expectedSlope);
+    } else if (r2Base < nearMax - 0.18 * range && nearMax >= dm.sceneMin + 0.40 * range) {
+      floorBaseline[2] = nearMax;
+    } else {
+      floorBaseline[2] = r2Base;
+    }
+
+    // Row 1 (mid walking ground)
+    const r1Base = rowBaseline[1];
+    const row1Values = grid.filter(c => c.r === 1).map(c => cellDepth[c.r * COLS + c.c]);
+    const midMax = Math.max(...row1Values);
+    const normalSlope = Math.max(0.08 * range, (floorBaseline[2] - (rowBaseline[0] ?? (floorBaseline[2] - 0.25 * range))) * 0.5);
+    const expectedRow1 = floorBaseline[2] - normalSlope;
+    if (r1Base < expectedRow1 - 0.15 * range && floorBaseline[2] >= dm.sceneMin + 0.35 * range) {
+      floorBaseline[1] = Math.max(midMax, expectedRow1);
+    } else {
+      floorBaseline[1] = r1Base;
+    }
+
+    // Row 0 (far background/horizon)
+    floorBaseline[0] = rowBaseline[0];
+    _lastFloorBaseline = floorBaseline;
+    _lastRange = range;
+
+    // ── 1. Positive obstacles (existing floor deviation) ──────────
     grid.forEach((cell, index) => {
       if (cell.status === 'obstacle') return;
       const normalizedDelta = (cellDepth[index] - rowBaseline[cell.r]) / range;
@@ -161,6 +264,444 @@
         cell.src = 'depth';
       }
     });
+
+    // ── FEATURE 1: Drop-off detection (Ground Discontinuity) ────────
+    const dropThreshold = CFG.dropoffDelta ?? 0.20;
+    const confidentDropThreshold = CFG.dropoffConfidentDelta ?? 0.32;
+    const dropCells = [];
+
+    // Focus on near and mid walking rows (rows 1 and 2 in 3-row grid)
+    grid.forEach((cell, index) => {
+      if (cell.r < 1) return;
+      const baseline = floorBaseline[cell.r];
+      // In a drop-off, depth is significantly farther (smaller inverse depth) than baseline
+      const dropDelta = (baseline - cellDepth[index]) / range;
+
+      if (dropDelta >= dropThreshold) {
+        cell.status = 'dropoff';
+        cell.zone = 'danger';
+        cell.src = 'depth-drop';
+        cell.dropDelta = dropDelta;
+        if (!dropCells.includes(cell)) dropCells.push(cell);
+      }
+    });
+
+    // ── Longitudinal Ground Discontinuity & Step Check ─────────────
+    // Along each column, test whether the mid ground falls away below
+    // the linear ground continuation between near ground (row 2) and far ground (row 0).
+    for (let c = 0; c < COLS; c++) {
+      const nearIdx = 2 * COLS + c;
+      const midIdx = 1 * COLS + c;
+      const farIdx = 0 * COLS + c;
+      const nearVal = cellDepth[nearIdx];
+      const midVal = cellDepth[midIdx];
+      const farVal = cellDepth[farIdx];
+      const isNearGround = (nearVal - dm.sceneMin) / range >= 0.40;
+      if (isNearGround && Number.isFinite(farVal)) {
+        // Linear ground plane expectation at mid row
+        const expectedMid = (nearVal + farVal) / 2;
+        // In a true drop-off, midVal plummets far below expectedMid
+        const dropDeltaLong = (expectedMid - midVal) / range;
+        if (dropDeltaLong >= dropThreshold) {
+          const midCell = grid[midIdx];
+          if (midCell.status !== 'obstacle' && midCell.status !== 'dropoff') {
+            midCell.status = 'dropoff';
+            midCell.zone = 'danger';
+            midCell.src = 'depth-drop';
+            midCell.dropDelta = Math.max(midCell.dropDelta || 0, dropDeltaLong);
+            if (!dropCells.includes(midCell)) dropCells.push(midCell);
+          }
+        }
+      }
+    }
+
+    let hazard = null;
+
+    // ── Hazard Classification: Descending Stairs, Drop-off, Ascending Stairs ──
+    const centerNear = _median([cellDepth[11], cellDepth[12], cellDepth[13]]);
+    const centerMid  = _median([cellDepth[6], cellDepth[7], cellDepth[8]]);
+    const centerFar  = _median([cellDepth[1], cellDepth[2], cellDepth[3]]);
+    const expectedCenterMid = (centerNear + centerFar) / 2;
+    const midElevation = (centerMid - expectedCenterMid) / range;
+
+    const stairDown = _detectDownwardStairs(dm, dropCells, grid, dw, dh, range);
+    const upward = _detectUpwardStairs(dm, grid, dw, dh, rowBaseline, range);
+
+    if (midElevation >= 0.08 && upward.isStairs) {
+      // Confirmed Ascending Stairs: mid ground is elevated above linear ground continuation
+      const isAmbiguous = Boolean(upward.isAmbiguous);
+      const hazardType = isAmbiguous ? 'stairs-ambiguous' : 'stairs-up';
+      const isConfident = !isAmbiguous && (upward.confidence === 'confident' || midElevation >= 0.14);
+      hazard = {
+        type: hazardType,
+        confidence: isConfident ? 'confident' : 'uncertain',
+        label: isConfident ? 'Stairs ahead (up)' : 'Possible steps ahead',
+        edgeCount: upward.edgeCount,
+        location: upward.location || { side: 'center', row: 'mid' },
+        cells: upward.affectedCells
+      };
+      upward.affectedCells.forEach(cell => {
+        if (cell.status === 'clear') {
+          cell.status = 'caution';
+          cell.zone = 'medium';
+          cell.src = 'depth-stairs';
+        }
+      });
+    } else if (dropCells.length > 0 || midElevation <= -0.06 || (stairDown.isStairs && !upward.isStairs)) {
+      if (stairDown.isStairs) {
+        const isConfident = stairDown.confidence === 'confident' || (dropCells.length >= 2 && stairDown.edgeCount >= 2);
+        hazard = {
+          type: 'stairs-down',
+          confidence: isConfident ? 'confident' : 'uncertain',
+          label: isConfident ? 'Descending stairs ahead' : 'Possible descending stairs ahead',
+          edgeCount: stairDown.edgeCount,
+          location: stairDown.location || { side: 'center', row: 'mid' },
+          cells: dropCells.length ? dropCells : grid.filter(c => (c.r === 1 || c.r === 2) && c.c >= 1 && c.c <= 3)
+        };
+        hazard.cells.forEach(cell => {
+          cell.status = 'dropoff';
+          cell.zone = 'danger';
+          cell.src = 'depth-stairs';
+        });
+      } else if (dropCells.length > 0) {
+        // Single ground discontinuity / curb / drop-off
+        const maxDelta = Math.max(...dropCells.map(c => c.dropDelta || 0));
+        const centerDrop = dropCells.some(c => c.c >= 1 && c.c <= 3);
+        const multiCell = dropCells.length >= 2;
+        let isConfident = maxDelta >= confidentDropThreshold && (multiCell || centerDrop);
+
+        // Temporal consistency: if uncertain drop-off persists across frames with consistent delta,
+        // elevate to confident
+        if (_hazardTracker.type === 'dropoff' && maxDelta >= dropThreshold + 0.05) {
+          if (_hazardTracker.consecutiveFrames >= (CFG.dropoffConfirmFrames ?? 3)) {
+            isConfident = true;
+          }
+        }
+
+        hazard = {
+          type: 'dropoff',
+          confidence: isConfident ? 'confident' : 'uncertain',
+          label: isConfident ? 'Drop-off ahead' : 'Possible drop-off ahead',
+          maxDelta,
+          location: {
+            side: centerDrop ? 'center' : (dropCells[0]?.c < 2 ? 'left' : 'right'),
+            row: dropCells.some(c => c.r === 2) ? 'near' : 'mid'
+          },
+          cells: dropCells
+        };
+      }
+    } else if (upward.isStairs) {
+      // Ambiguous stair structure (detected steps without confirmed elevation/depression)
+      hazard = {
+        type: 'stairs-ambiguous',
+        confidence: 'uncertain',
+        label: 'Possible steps ahead',
+        edgeCount: upward.edgeCount,
+        location: upward.location || { side: 'center', row: 'mid' },
+        cells: upward.affectedCells
+      };
+      upward.affectedCells.forEach(cell => {
+        if (cell.status === 'clear') {
+          cell.status = 'caution';
+          cell.zone = 'medium';
+          cell.src = 'depth-stairs';
+        }
+      });
+    }
+
+    // Update temporal hazard tracker
+    if (hazard && hazard.type) {
+      if (_hazardTracker.type === hazard.type) {
+        _hazardTracker.consecutiveFrames++;
+      } else {
+        _hazardTracker.type = hazard.type;
+        _hazardTracker.consecutiveFrames = 1;
+      }
+      _hazardTracker.lastSeen = Date.now();
+      _hazardTracker.confidence = hazard.confidence;
+      _hazardTracker.maxDelta = hazard.maxDelta || 0;
+    } else {
+      _hazardTracker.type = null;
+      _hazardTracker.confidence = 'none';
+      _hazardTracker.consecutiveFrames = 0;
+    }
+
+    return hazard;
+  }
+
+  /* ═══════════════════════════════════════════════════════════════
+     SOURCE 3 — Surface Segmentation Fusion
+     1. Integrates semantic surface predictions with navigation grid
+     2. Identifies structural walls and barriers
+     3. Fuses semantic stairs confirmation with depth step analysis
+     4. Marks roadway cautions
+     5. Strict safety guarantee: sidewalk alone NEVER overrides
+        an existing obstacle or depth drop-off!
+  ═══════════════════════════════════════════════════════════════ */
+  function _applySurfaces(grid, sm, vw, vh, existingHazard) {
+    if (!sm || !sm.cells || !Array.isArray(sm.cells)) return existingHazard;
+    let hazard = existingHazard;
+
+    const wallThreshold = CFG.wallObstacleThreshold ?? 0.45;
+    const stairsThreshold = CFG.stairsConfirmThreshold ?? 0.25;
+    const roadThreshold = CFG.roadCautionThreshold ?? 0.40;
+
+    let hasCenterStairSurface = false;
+
+    grid.forEach(cell => {
+      const match = sm.cells.find(sc => sc.r === cell.r && sc.c === cell.c);
+      if (!match) return;
+
+      cell.surfaceCategory = match.primaryCategory || 'unknown';
+      cell.surfaceConfidence = match.confidence || 0;
+      cell.surfaceShares = match.shares || null;
+
+      const shares = match.shares || {};
+
+      // ── 1. Wall / Barrier Obstacles ──────────────────────────────
+      if (shares.wall >= wallThreshold || match.primaryCategory === 'wall') {
+        if (cell.status !== 'obstacle') {
+          cell.status = 'obstacle';
+          cell.zone = cell.r === 2 ? 'danger' : cell.r === 1 ? 'close' : 'medium';
+          cell.src = 'surface-wall';
+          cell.label = 'Wall/Barrier';
+        }
+      }
+
+      // ── 2. Stairs Semantic Confirmation ──────────────────────────
+      if (shares.stairs >= stairsThreshold || match.primaryCategory === 'stairs') {
+        if (cell.c >= 1 && cell.c <= 3) {
+          hasCenterStairSurface = true;
+          if (cell.status === 'clear') {
+            cell.status = 'caution';
+            cell.zone = 'medium';
+            cell.src = 'surface-stairs';
+          }
+        }
+      }
+
+      // ── 3. Road Surface Caution ──────────────────────────────────
+      if (shares.road >= roadThreshold || match.primaryCategory === 'road') {
+        if (cell.c >= 1 && cell.c <= 3 && cell.r >= 1) {
+          if (cell.status === 'clear') {
+            cell.status = 'caution';
+            cell.zone = cell.r === 2 ? 'close' : 'medium';
+            cell.src = 'surface-road';
+          }
+        }
+      }
+
+      // ── 4. Footpath / Sidewalk (CRITICAL SAFETY RULE) ─────────────
+      // Sidewalk or footpath alone NEVER overrides an obstacle or drop-off!
+      // If cell.status is 'obstacle' or 'dropoff', we keep it strictly intact.
+    });
+
+    // ── Fuse Semantic Stairs Evidence with Depth Hazards ──────────
+    if (hasCenterStairSurface) {
+      if (hazard && hazard.type) {
+        if (hazard.type.startsWith('stairs')) {
+          hazard = {
+            ...hazard,
+            confidence: 'confident',
+            label: hazard.type === 'stairs-down'
+              ? 'Descending stairs ahead'
+              : (hazard.type === 'stairs-up' ? 'Stairs ahead (up)' : 'Stairs ahead'),
+            surfaceConfirmed: true
+          };
+        }
+      } else {
+        hazard = {
+          type: 'stairs-up',
+          confidence: 'uncertain',
+          label: 'Possible steps ahead',
+          edgeCount: 1,
+          location: { side: 'center', row: 'mid' },
+          cells: grid.filter(c => (c.r === 1 || c.r === 2) && c.c >= 1 && c.c <= 3 && c.surfaceCategory === 'stairs'),
+          surfaceConfirmed: true
+        };
+      }
+    }
+
+    return hazard;
+  }
+
+  /**
+   * FEATURE 2: Downward-stair detection
+   * Tests whether multiple descending horizontal stair edges can be identified reliably
+   * in the depth map within the walking corridor.
+   */
+  function _detectDownwardStairs(dataOrDm, dropOrDw, dhOrGrid, maybeDw, maybeDh, maybeRange) {
+    let data, dw, dh, range;
+    if (dataOrDm && dataOrDm.data) {
+      data = dataOrDm.data;
+      dw = dataOrDm.width;
+      dh = dataOrDm.height;
+      range = Math.max(1e-6, (dataOrDm.sceneMax ?? 1) - (dataOrDm.sceneMin ?? 0));
+    } else {
+      data = dataOrDm;
+      dw = maybeDw || dropOrDw;
+      dh = maybeDh || dhOrGrid;
+      range = maybeRange || 1;
+    }
+
+    if (!data?.length || !dw || !dh) return { isStairs: false, edgeCount: 0, confidence: 'none' };
+
+    // Reject downward stairs if walking path mid-ground is elevated with no drop-off (confirms ascending stairs)
+    const grid = Array.isArray(dhOrGrid) ? dhOrGrid : (Array.isArray(dropOrDw) ? dropOrDw : []);
+    const dropCells = Array.isArray(dropOrDw) ? dropOrDw : [];
+    const centerMidCells = grid.filter(c => c.r === 1 && c.c >= 1 && c.c <= 3);
+    const hasElevatedMid = centerMidCells.some(cell => cell.status === 'obstacle' || cell.status === 'caution');
+    if (hasElevatedMid && dropCells.length === 0) {
+      return { isStairs: false, edgeCount: 0, confidence: 'none' };
+    }
+
+    const minEdges = CFG.stairEdgeMinCount ?? 2;
+    const threshold = (CFG.stairEdgeThreshold ?? 0.08) * range;
+
+    // Scan vertical columns across left-center, center, and right-center walking paths
+    const xPositions = [
+      Math.floor(dw * 0.35),
+      Math.floor(dw * 0.50),
+      Math.floor(dw * 0.65)
+    ];
+
+    const yStart = Math.floor(dh * 0.35);
+    const yEnd   = Math.floor(dh * 0.95);
+    const stepY  = Math.max(1, Math.floor(dh / 60));
+
+    const detectedEdges = [];
+    let lastEdgeY = -100;
+    const minEdgeSeparation = Math.max(3, Math.floor(dh / 18));
+
+    for (let y = yStart; y < yEnd - stepY; y += stepY) {
+      let matchingColumns = 0;
+      for (const x of xPositions) {
+        const idx1 = y * dw + x;
+        const idx2 = (y + stepY) * dw + x;
+        const val1 = data[idx1];
+        const val2 = data[idx2];
+        if (Number.isFinite(val1) && Number.isFinite(val2)) {
+          if (Math.abs(val1 - val2) >= threshold) {
+            matchingColumns++;
+          }
+        }
+      }
+
+      // If at least 2 of 3 columns show a step edge at this Y, it is a horizontal step edge
+      if (matchingColumns >= 2 && (y - lastEdgeY >= minEdgeSeparation)) {
+        detectedEdges.push({ y, strength: matchingColumns });
+        lastEdgeY = y;
+      }
+    }
+
+    const isStairs = detectedEdges.length >= minEdges;
+    const isConfident = detectedEdges.length >= 3;
+    const firstY = detectedEdges[0]?.y ?? 0;
+    const lastY = detectedEdges[detectedEdges.length - 1]?.y ?? 0;
+
+    return {
+      isStairs,
+      confidence: isConfident ? 'confident' : (isStairs ? 'uncertain' : 'none'),
+      edgeCount: detectedEdges.length,
+      edges: detectedEdges,
+      location: isStairs ? {
+        side: 'center',
+        row: lastY > dh * 0.67 ? 'near' : 'mid',
+        yStartNorm: firstY / dh,
+        yEndNorm: lastY / dh
+      } : null
+    };
+  }
+
+  /**
+   * FEATURE 3: Upward-stair detection
+   * Validates step-pattern analysis (periodic horizontal riser jumps and tread plateaus
+   * with elevation rising steeper than flat ground).
+   */
+  function _detectUpwardStairs(dataOrDm, gridOrDw, dhOrBase, maybeDh, maybeBase, maybeRange) {
+    let data, dw, dh, grid, rowBaseline, range;
+    if (dataOrDm && dataOrDm.data) {
+      data = dataOrDm.data;
+      dw = dataOrDm.width;
+      dh = dataOrDm.height;
+      grid = gridOrDw;
+      rowBaseline = dhOrBase;
+      range = Math.max(1e-6, (dataOrDm.sceneMax ?? 1) - (dataOrDm.sceneMin ?? 0));
+    } else {
+      data = dataOrDm;
+      dw = gridOrDw;
+      dh = maybeDh || dhOrBase;
+      grid = maybeBase || [];
+      range = maybeRange || 1;
+      rowBaseline = [];
+    }
+
+    if (!data?.length || !dw || !dh) return { isStairs: false, edgeCount: 0, confidence: 'none', affectedCells: [] };
+
+    const minRisers = CFG.stepPatternMinRisers ?? 2;
+    const threshold = (CFG.stairEdgeThreshold ?? 0.08) * range;
+
+    const xPositions = [
+      Math.floor(dw * 0.35),
+      Math.floor(dw * 0.50),
+      Math.floor(dw * 0.65)
+    ];
+
+    const yStart = Math.floor(dh * 0.20);
+    const yEnd   = Math.floor(dh * 0.85);
+    const stepY  = Math.max(1, Math.floor(dh / 60));
+
+    const detectedRisers = [];
+    let lastRiserY = -100;
+    const minRiserSeparation = Math.max(3, Math.floor(dh / 18));
+
+    for (let y = yStart; y < yEnd - stepY; y += stepY) {
+      let matchingColumns = 0;
+      for (const x of xPositions) {
+        const idx1 = y * dw + x;
+        const idx2 = (y + stepY) * dw + x;
+        const val1 = data[idx1];
+        const val2 = data[idx2];
+        if (Number.isFinite(val1) && Number.isFinite(val2)) {
+          if (Math.abs(val1 - val2) >= threshold) {
+            matchingColumns++;
+          }
+        }
+      }
+
+      if (matchingColumns >= 2 && (y - lastRiserY >= minRiserSeparation)) {
+        detectedRisers.push({ y, strength: matchingColumns });
+        lastRiserY = y;
+      }
+    }
+
+    const centerMidCells = Array.isArray(grid)
+      ? grid.filter(c => c.r === 1 && c.c >= 1 && c.c <= 3)
+      : [];
+    const elevated = centerMidCells.some(cell => cell.status === 'obstacle' || cell.status === 'caution');
+
+    const isStairs = detectedRisers.length >= minRisers;
+    const isConfident = (detectedRisers.length >= 3) || (detectedRisers.length >= 2 && elevated);
+    const isAmbiguous = isStairs && !isConfident;
+    const affectedCells = Array.isArray(grid)
+      ? grid.filter(c => (c.r === 1 || c.r === 2) && c.c >= 1 && c.c <= 3)
+      : [];
+    const firstY = detectedRisers[0]?.y ?? 0;
+    const lastY = detectedRisers[detectedRisers.length - 1]?.y ?? 0;
+
+    return {
+      isStairs,
+      confidence: isConfident ? 'confident' : (isStairs ? 'uncertain' : 'none'),
+      isAmbiguous,
+      edgeCount: detectedRisers.length,
+      affectedCells,
+      location: isStairs ? {
+        side: 'center',
+        row: 'mid',
+        yStartNorm: firstY / dh,
+        yEndNorm: lastY / dh
+      } : null
+    };
   }
 
   function _cellMedian(data, dw, dh, cell) {
@@ -184,16 +725,19 @@
   function _smoothGrid(grid) {
     const alpha = CFG.smoothing ?? 0.55;
     return grid.map((cell, index) => {
-      const current = cell.status === 'obstacle' ? 1 : cell.status === 'caution' ? 0.5 : 0;
+      const isDrop = cell.status === 'dropoff';
+      const current = (cell.status === 'obstacle' || isDrop) ? 1 : cell.status === 'caution' ? 0.5 : 0;
       const previous = _smoothedCells[index];
       // Raise new hazards immediately; smooth only the decay to reduce flicker.
       const severity = !previous || current > previous.severity
         ? current
         : previous.severity * (1-alpha) + current * alpha;
-      const status = severity >= (CFG.obstacleThreshold ?? 0.62) ? 'obstacle'
+      const status = isDrop ? 'dropoff'
+        : severity >= (CFG.obstacleThreshold ?? 0.62) ? 'obstacle'
         : severity >= (CFG.cautionThreshold ?? 0.26) ? 'caution' : 'clear';
       const next = {
         severity,
+        status,
         zone: cell.zone || (status !== 'clear' ? previous?.zone : null),
         src: cell.src || (status !== 'clear' ? previous?.src : null)
       };
@@ -205,8 +749,8 @@
   /* ═══════════════════════════════════════════════════════════════
      NAVIGATION ADVICE
   ═══════════════════════════════════════════════════════════════ */
-  function _computeAdvice(grid) {
-    const isObs = c => c.status === 'obstacle';
+  function _computeAdvice(grid, hazard) {
+    const isObs = c => c.status === 'obstacle' || c.status === 'dropoff';
 
     // Bottom row — visually nearest image region (not a metric distance)
     const near = grid.filter(c => c.r === ROWS - 1);
@@ -219,9 +763,116 @@
     const mC  = mid.filter(c => c.c >= 1 && c.c <= 3);
 
     const lClear  = nL.every(c => !isObs(c));
-    const cClear  = nC.every(c => !isObs(c));
+    const cClear  = nC.every(c => !isObs(c)) && mC.every(c => !isObs(c));
     const rClear  = nR.every(c => !isObs(c));
     const mcClear = mC.every(c => !isObs(c));
+
+    // ── FEATURE 4: Hazard Advice Integration ──────────────────────
+    if (hazard && hazard.type) {
+      let speech = '', summary = '', direction = 'slow';
+
+      if (hazard.type === 'dropoff') {
+        if (hazard.confidence === 'uncertain') {
+          // PROMPT REQUIREMENT: Say "Possible drop-off ahead" when confidence is uncertain
+          speech = 'Possible drop-off ahead. Proceed with caution.';
+          summary = 'Possible drop-off';
+          direction = 'slow';
+        } else {
+          speech = 'Drop-off detected ahead. Stop and check your step.';
+          summary = 'Drop-off ahead';
+          direction = 'stop';
+        }
+        if (!cClear) {
+          if (lClear && !rClear) speech += ' The left side appears clearer.';
+          else if (!lClear && rClear) speech += ' The right side appears clearer.';
+        }
+        return { speech, summary, direction, lClear, cClear, rClear, hazard };
+      }
+
+      if (hazard.type === 'stairs-down') {
+        if (hazard.confidence === 'uncertain') {
+          // PROMPT REQUIREMENT: "Possible descending stairs ahead. Stop and check."
+          speech = 'Possible descending stairs ahead. Stop and check.';
+          summary = 'Possible descending stairs';
+          direction = 'stop';
+        } else {
+          speech = 'Descending stairs ahead. Stop and check your step.';
+          summary = 'Descending stairs';
+          direction = 'stop';
+        }
+        return { speech, summary, direction, lClear, cClear, rClear, hazard };
+      }
+
+      if (hazard.type === 'stairs-up') {
+        if (hazard.confidence === 'uncertain') {
+          // PROMPT REQUIREMENT: "Possible steps ahead. Approach cautiously."
+          speech = 'Possible steps ahead. Approach cautiously.';
+          summary = 'Possible steps';
+          direction = 'slow';
+        } else {
+          speech = 'Stairs ahead leading up. Approach carefully.';
+          summary = 'Stairs up';
+          direction = 'slow';
+        }
+        return { speech, summary, direction, lClear, cClear, rClear, hazard };
+      }
+
+      if (hazard.type === 'stairs-ambiguous') {
+        speech = 'Possible steps ahead. Approach cautiously.';
+        summary = 'Possible steps';
+        direction = 'slow';
+        return { speech, summary, direction, lClear, cClear, rClear, hazard };
+      }
+
+      if (hazard.type === 'uncovered-drain') {
+        speech = hazard.confidence === 'uncertain'
+          ? 'Possible uncovered drain ahead. Proceed with caution.'
+          : 'Uncovered drain detected ahead. Please stop.';
+        summary = hazard.confidence === 'uncertain' ? 'Possible drain' : 'Uncovered drain';
+        direction = 'stop';
+        return { speech, summary, direction, lClear, cClear, rClear, hazard };
+      }
+
+      if (hazard.type === 'pothole') {
+        speech = hazard.confidence === 'uncertain'
+          ? 'Possible pothole ahead.'
+          : 'Pothole detected ahead. Step carefully.';
+        summary = hazard.confidence === 'uncertain' ? 'Possible pothole' : 'Pothole ahead';
+        direction = 'slow';
+        if (!cClear && hazard.confidence === 'confident') {
+          if (lClear && !rClear) speech += ' The left side appears clearer.';
+          else if (!lClear && rClear) speech += ' The right side appears clearer.';
+        }
+        return { speech, summary, direction, lClear, cClear, rClear, hazard };
+      }
+
+      if (hazard.type === 'curb') {
+        speech = hazard.confidence === 'uncertain'
+          ? 'Possible curb edge ahead.'
+          : 'Curb edge ahead. Step carefully.';
+        summary = 'Curb edge';
+        direction = 'slow';
+        return { speech, summary, direction, lClear, cClear, rClear, hazard };
+      }
+
+      if (hazard.type === 'raised-surface') {
+        speech = hazard.confidence === 'uncertain'
+          ? 'Possible raised surface ahead.'
+          : 'Raised surface ahead. Watch your step.';
+        summary = 'Raised surface';
+        direction = 'slow';
+        return { speech, summary, direction, lClear, cClear, rClear, hazard };
+      }
+
+      if (hazard.type === 'broken-pavement') {
+        speech = hazard.confidence === 'uncertain'
+          ? 'Possible uneven pavement ahead.'
+          : 'Uneven, broken pavement ahead. Watch your footing.';
+        summary = 'Uneven pavement';
+        direction = 'slow';
+        return { speech, summary, direction, lClear, cClear, rClear, hazard };
+      }
+    }
 
     // Closest detected obstacle in center path
     const cObs  = nC.find(isObs) || mC.find(isObs);
@@ -230,9 +881,18 @@
     let speech = '', summary = '', direction = 'forward';
 
     if (lClear && cClear && rClear && mcClear) {
-      speech    = 'No tracked obstacle is ahead. Continue carefully.';
-      summary   = 'No alert ahead';
-      direction = 'forward';
+      // Safety rule: Unknown observations must not be interpreted as proof of safety!
+      const nearCells = grid.filter(c => c.r === ROWS - 1 && c.c >= 1 && c.c <= 3);
+      const isUnverified = nearCells.every(c => c.surfaceCategory === 'unknown' && (!c.surfaceConfidence || c.surfaceConfidence < 0.25));
+      if (isUnverified && (!window.depthAPI || !window.depthAPI.isLoaded?.())) {
+        speech    = 'Surface visibility is limited. Proceed with caution.';
+        summary   = 'Caution — limited visibility';
+        direction = 'slow';
+      } else {
+        speech    = 'No tracked obstacle is ahead. Continue carefully.';
+        summary   = 'No alert ahead';
+        direction = 'forward';
+      }
 
     } else if (cClear && mcClear) {
       summary   = 'No center alert';
@@ -316,15 +976,31 @@
   }
 
   function _cellColor(cell) {
+    if (cell.src === 'hazard-drain') return 'rgba(239,68,68,0.55)'; // Deep red for uncovered drain
+    if (cell.src === 'hazard-pothole') return 'rgba(249,115,22,0.40)'; // Orange for pothole
+    if (cell.src === 'hazard-curb') return 'rgba(234,179,8,0.35)'; // Yellow for curb step
+    if (cell.src === 'hazard-raised') return 'rgba(245,158,11,0.35)'; // Amber for raised surface
+    if (cell.src === 'hazard-broken') return 'rgba(217,119,6,0.30)'; // Brown-amber for broken pavement
+
+    if (cell.status === 'dropoff') {
+      return 'rgba(168,85,247,0.45)'; // Distinct purple/violet for drop-off discontinuity
+    }
     if (cell.status === 'obstacle') {
+      if (cell.src === 'surface-wall') return 'rgba(239,68,68,0.46)'; // Red for wall/barrier
       switch (cell.zone) {
         case 'danger': return 'rgba(248,113,113,0.42)';
         case 'close':  return 'rgba(251,146,60,0.36)';
         default:       return 'rgba(250,204,21,0.28)';
       }
     }
-    if (cell.status === 'caution') return 'rgba(250,204,21,0.16)';
-    // Clear — subtle green only on near+mid rows
+    if (cell.status === 'caution') {
+      if (cell.src === 'surface-road') return 'rgba(245,158,11,0.32)'; // Amber for road caution
+      return cell.src === 'depth-stairs' || cell.src === 'surface-stairs' ? 'rgba(251,146,60,0.25)' : 'rgba(250,204,21,0.16)';
+    }
+    // Clear — subtle green only on near+mid rows for verified footpath/floor
+    if (cell.surfaceCategory === 'footpath' || cell.surfaceCategory === 'floor') {
+      return cell.r >= 1 ? 'rgba(74,222,128,0.18)' : 'rgba(74,222,128,0.08)';
+    }
     return cell.r >= 1 ? 'rgba(74,222,128,0.14)' : 'rgba(74,222,128,0.06)';
   }
 
@@ -333,9 +1009,20 @@
     const y  = h - rH;
     const t3 = w / 3;
 
+    const centerLabel = !advice.cClear
+      ? (advice.hazard?.type === 'uncovered-drain' ? '⚠️ Drain'
+         : advice.hazard?.type === 'pothole' ? '🕳️ Pothole'
+         : advice.hazard?.type === 'curb' ? '📐 Curb'
+         : advice.hazard?.type === 'raised-surface' ? '⚡ Raised'
+         : advice.hazard?.type === 'broken-pavement' ? '〰️ Uneven'
+         : advice.hazard?.type === 'dropoff' ? '⚠️ Drop-off'
+         : advice.hazard?.type?.startsWith('stairs') ? '🪜 Stairs'
+         : '⛔ Obstacle')
+      : '▲ No alert';
+
     const panels = [
       { x: 0,      label: advice.lClear ? '← No alert' : '← Block', clear: advice.lClear },
-      { x: t3,     label: advice.cClear ? '▲ No alert' : '⛔ Obstacle',  clear: advice.cClear },
+      { x: t3,     label: centerLabel,  clear: advice.cClear },
       { x: t3 * 2, label: advice.rClear ? 'No alert →' : 'Block →',  clear: advice.rClear },
     ];
 

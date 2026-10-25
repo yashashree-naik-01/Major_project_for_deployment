@@ -64,6 +64,7 @@ async function retry(url) {
   await new Promise(resolve => upstream.listen(upstreamPort, '127.0.0.1', resolve));
   const app = spawn(process.execPath, ['server.cjs'], { windowsHide: true, stdio: 'ignore', env: { ...process.env,
     PORT: String(appPort), GRAPHHOPPER_API_KEY: 'server-only-test-key',
+    GEOAPIFY_API_KEY: '',
     SUPABASE_URL: 'https://project.supabase.co', SUPABASE_PUBLISHABLE_KEY: 'sb_publishable_test',
     SUPABASE_AUTH_USER_URL: `http://127.0.0.1:${upstreamPort}/auth/user`,
     TWILIO_ACCOUNT_SID: `AC${'b'.repeat(32)}`, TWILIO_AUTH_TOKEN: 'server-only-twilio-token',

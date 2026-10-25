@@ -54,6 +54,7 @@
     getLatestObservation: () => window.sceneStateAPI?.getSnapshot?.() || latestPipelineResult,
     isActive: () => detectionActive,
     describeLatest,
+    announceScene: _announceScene,
   };
 
   /* ═══════════════════════════════════════════════════════════════
@@ -80,9 +81,17 @@
       _emitBadge('od-status-badge', '⚠️ Detection unavailable', 'od-badge-error');
       if (detectionActive) {
         window.sceneStateAPI?.setStatus?.('error', modelError);
-        window.guidanceAPI?.announce?.('Live visual analysis is unavailable. Do not rely on camera guidance.', {
-          key: 'vision-model-unavailable', priority: 85, interrupt: true, cooldownMs: 30000
-        });
+        if (window.guidanceAPI?.reportSystemStatus) {
+          window.guidanceAPI.reportSystemStatus({
+            type: 'model',
+            level: 'error',
+            message: 'Live visual analysis is unavailable. Do not rely on camera guidance.'
+          });
+        } else {
+          window.guidanceAPI?.announce?.('Live visual analysis is unavailable. Do not rely on camera guidance.', {
+            key: 'health:error:model', priority: 95, interrupt: true, cooldownMs: 25000
+          });
+        }
       }
       return null;
     } finally { modelLoadPromise = null; }})();
@@ -209,18 +218,39 @@
       consecutiveErrors = 0;
       _emitBadge('od-status-badge', withRisk.length ? `${withRisk.length} tracked object${withRisk.length === 1 ? '' : 's'}` : 'No tracked obstacles', 'od-badge-ready');
 
+      // Adaptive mobile interval calculation
+      const hasUrgentThreat = withRisk.some(t => t.risk?.level === 'high' || t.motion?.trajectory === 'approaching') ||
+                              Boolean(safeDir?.hazard);
+      const isCompletelyIdle = withRisk.length === 0;
+      const baseInterval = CFG.intervalMs || 900;
+      const adaptiveTarget = hasUrgentThreat
+        ? Math.max(600, Math.round(baseInterval * 0.85))
+        : isCompletelyIdle
+        ? Math.round(baseInterval * 1.35)
+        : baseInterval;
+      const nextDelay = Math.max(100, adaptiveTarget - processingMs);
+      _schedule(nextDelay);
+      return;
     } catch (err) {
       consecutiveErrors++;
       if (window.VisionGuideConfig?.debug) console.warn('[VisionGuide OD] Frame error:', err);
       _emitBadge('od-status-badge', 'Vision processing recovering…', 'od-badge-error');
       if (consecutiveErrors >= 3) {
         window.sceneStateAPI?.setStatus?.('degraded', err.message || 'Inference failed');
-        window.guidanceAPI?.announce?.('Live visual analysis is temporarily unavailable. Stop and check your surroundings.', {
-          key: 'vision-processing-degraded', priority: 85, interrupt: true, cooldownMs: 30000
-        });
+        if (window.guidanceAPI?.reportSystemStatus) {
+          window.guidanceAPI.reportSystemStatus({
+            type: 'model',
+            level: 'error',
+            message: 'Live visual analysis is temporarily unavailable. Stop and check your surroundings.'
+          });
+        } else {
+          window.guidanceAPI?.announce?.('Live visual analysis is temporarily unavailable. Stop and check your surroundings.', {
+            key: 'health:error:model', priority: 95, interrupt: true, cooldownMs: 25000
+          });
+        }
       }
     }
-    _schedule(consecutiveErrors ? (CFG.errorBackoffMs || 1800) : DETECT_INTERVAL);
+    _schedule(consecutiveErrors ? (CFG.errorBackoffMs || 1800) : (CFG.intervalMs || 900));
   }
 
   /* ═══════════════════════════════════════════════════════════════
@@ -474,27 +504,36 @@
      GUIDANCE — one prioritised scene message, never competing voices
   ═══════════════════════════════════════════════════════════════ */
   function _announceScene(tracks, safeDir, videoWidth) {
-    if (!safeDir || !window.riskAPI?.shouldAnnounceDir?.(safeDir.direction)) return;
+    if (!safeDir || !window.riskAPI?.shouldAnnounceDir?.(safeDir.direction, safeDir.hazard)) return;
     const highest = tracks?.[0];
     const highRisk = highest?.risk?.level === 'high';
-    const urgent = highRisk || safeDir.direction === 'stop';
+    const hazard = safeDir.hazard;
+    const hasHazard = Boolean(hazard?.type || hazard?.category);
+    const hType = hazard?.category || hazard?.type;
+    const hConf = hazard?.confidence;
+    const isCriticalHazard = hasHazard && (hType === 'dropoff' || hType === 'stairs-down' || hType === 'uncovered-drain') && hConf === 'confident';
+    const isImmediateObstacle = highRisk && highest?.distInfo?.zone === 'danger';
+    const urgent = isCriticalHazard || isImmediateObstacle || highRisk || safeDir.direction === 'stop' || hasHazard;
     const centre = highest ? (highest.bbox[0] + highest.bbox[2] / 2) / videoWidth : 0.5;
     const side = centre < 0.38 ? 'on your left' : centre > 0.62 ? 'on your right' : 'ahead';
     const approaching = highest?.motion?.trajectory === 'approaching';
     let text = safeDir.speech;
-    if (highRisk && !text.toLowerCase().includes(highest.label)) {
+    // Prioritize imminent hazards over routine object descriptions
+    if (!hasHazard && highRisk && !text.toLowerCase().includes(highest.label)) {
       text = `${_cap(highest.label)} ${side}${approaching ? ', approaching' : ''}. ${text}`;
     }
-    const priority = urgent ? 100 : highest?.risk?.level === 'medium' ? 85 : 30;
-    const key = urgent
+    const priority = (isCriticalHazard || isImmediateObstacle) ? 110 : (urgent ? 100 : (highest?.risk?.level === 'medium' || hasHazard) ? 85 : 30);
+    const key = hasHazard
+      ? `hazard:${hType}:${hConf || 'unknown'}:${safeDir.direction}`
+      : urgent
       ? `risk:${highest?.id || 'scene'}:${highest?.risk?.level || 'blocked'}:${highest?.distInfo?.zone || 'unknown'}:${highest?.motion?.trajectory || 'unknown'}`
       : `direction:${safeDir.direction}:${highest?.risk?.level || 'clear'}`;
-    window.riskAPI.markDirSent(safeDir.direction);
+    window.riskAPI.markDirSent(safeDir.direction, safeDir.hazard);
     if (window.guidanceAPI) {
       window.guidanceAPI.announce(text, {
         key,
         priority,
-        interrupt: urgent,
+        interrupt: priority >= 90,
         cooldownMs: urgent ? (GUIDE_CFG.objectCooldownMs || 9000) : (GUIDE_CFG.directionCooldownMs || 6500)
       });
     } else if (typeof speak === 'function') speak(text);

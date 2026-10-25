@@ -47,6 +47,7 @@ function attachCamera() {
     // render() replaces DOM nodes. Rebind each replacement to the live session.
     window.objectDetectionAPI?.startDetection?.(video, canvas);
     window.depthAPI?.startDepthLoop?.(video);
+    window.surfaceSegmentationAPI?.startSurfaceLoop?.(video);
   }
   if (cameraState === 'live') refreshLiveGuide(window.sceneStateAPI?.getSnapshot?.());
   refreshVoiceStatus();
@@ -65,9 +66,10 @@ function stopCamera({ announce = false } = {}) {
   cameraState = 'off';
   cameraError = '';
   pauseCameraDemo();
-  // Stop object detection + depth estimation when camera turns off
+  // Stop object detection, depth estimation, and surface segmentation when camera turns off
   if (window.objectDetectionAPI) window.objectDetectionAPI.stopDetection();
   if (window.depthAPI) window.depthAPI.stopDepthLoop();
+  if (window.surfaceSegmentationAPI) window.surfaceSegmentationAPI.stopSurfaceLoop();
   if (announce) speak('Camera is off.');
 }
 
@@ -103,6 +105,7 @@ async function requestCamera() {
       pauseCameraDemo();
       if (window.objectDetectionAPI) window.objectDetectionAPI.stopDetection();
       if (window.depthAPI) window.depthAPI.stopDepthLoop();
+      if (window.surfaceSegmentationAPI) window.surfaceSegmentationAPI.stopSurfaceLoop();
       if (page === 'camera') render();
     }));
     render();
@@ -199,14 +202,31 @@ function refreshLiveGuide(scene) {
   const unavailable = scene.status === 'error' || scene.status === 'degraded';
   action.textContent = unavailable ? 'Visual analysis unavailable' : scene.guidanceMessage || dirText || 'Continue carefully';
   const object = [...(scene.objects || [])].sort((a, b) => (b.riskScore || 0) - (a.riskScore || 0))[0];
-  document.getElementById('live-guide-object').textContent = unavailable ? 'Current frame analysis is paused' : object ? `${object.label} ${object.position || 'ahead'}` : 'No supported obstacle detected';
-  document.getElementById('live-guide-range').textContent = unavailable ? 'Do not rely on the previous result' : object?.distanceLabel || 'No measured distance · continue carefully';
+  const hazard = scene.hazard;
+
+  if (!unavailable && hazard && hazard.type) {
+    const isStairs = hazard.type.startsWith('stairs');
+    const isDrop = hazard.type === 'dropoff';
+    document.getElementById('live-guide-object').textContent = hazard.label || (isStairs ? 'Stairs' : 'Drop-off');
+    document.getElementById('live-guide-range').textContent = hazard.confidence === 'uncertain'
+      ? 'Uncertain · ground discontinuity'
+      : 'Hazard detected · relative depth';
+  } else {
+    document.getElementById('live-guide-object').textContent = unavailable ? 'Current frame analysis is paused' : object ? `${object.label} ${object.position || 'ahead'}` : 'No supported obstacle detected';
+    document.getElementById('live-guide-range').textContent = unavailable ? 'Do not rely on the previous result' : object?.distanceLabel || 'No measured distance · continue carefully';
+  }
+
   document.getElementById('live-scene-status').textContent = scene.status === 'active' ? 'Live' : scene.status;
   const card = document.getElementById('live-guide-card');
   card.classList.remove('clear', 'caution', 'stop');
-  card.classList.add(object?.riskLevel === 'high' ? 'stop' : object?.riskLevel === 'medium' ? 'caution' : 'clear');
+  const hazardLevel = hazard?.type === 'dropoff' && hazard?.confidence === 'confident' ? 'stop' : hazard?.type ? 'caution' : null;
+  card.classList.add(object?.riskLevel === 'high' || hazardLevel === 'stop' ? 'stop' : (object?.riskLevel === 'medium' || hazardLevel === 'caution') ? 'caution' : 'clear');
   const iconBox = document.getElementById('live-guide-icon');
-  if (iconBox) iconBox.innerHTML = icon(dir === 'left' ? 'left' : dir === 'right' ? 'right' : dir === 'stop' || object?.riskLevel === 'high' ? 'sos' : 'straight');
+  if (iconBox) {
+    const isStairs = hazard?.type?.startsWith('stairs');
+    const isDrop = hazard?.type === 'dropoff';
+    iconBox.innerHTML = icon(isStairs ? 'stairs' : isDrop ? 'sos' : dir === 'left' ? 'left' : dir === 'right' ? 'right' : dir === 'stop' || object?.riskLevel === 'high' ? 'sos' : 'straight');
+  }
 }
 
 window.sceneStateAPI?.subscribe?.(refreshLiveGuide);

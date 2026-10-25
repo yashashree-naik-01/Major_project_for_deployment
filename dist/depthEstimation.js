@@ -60,9 +60,13 @@
   let depthLoaded     = false;
   let depthError      = null;
   let depthLoadPromise = null;
+  let activeDevice    = 'none';
+
+  // Pre-allocated reusable quantile sampling buffer (4096 elements = 16KB, 0 GC churn)
+  const sampledBuffer = new Float32Array(4096);
 
   // Current depth map data
-  let depthData       = null;   // Float32Array from Depth-Anything-V2
+  let depthData       = null;   // Reusable Float32Array from Depth-Anything-V2
   let depthW          = 0;
   let depthH          = 0;
   let depthSceneMin   = 0;
@@ -90,6 +94,7 @@
     getZones:            () => ZONES,
     isLoaded:            () => depthLoaded,
     isLoading:           () => depthLoading,
+    getDevice:           () => activeDevice,
     hasDepthMap:         () => Boolean(depthData && depthTimestamp && Date.now() - depthTimestamp <= (CFG.staleAfterMs || 6500)),
     getDepthAge:         () => depthTimestamp ? Date.now() - depthTimestamp : Infinity,
     getError:            () => depthError,
@@ -112,7 +117,7 @@
   /* ═══════════════════════════════════════════════════════════════
      MODEL LOADING
   ═══════════════════════════════════════════════════════════════ */
-  async function loadModel() {
+  async function loadModel(options = {}) {
     if (depthLoaded) return depthPipeline;
     if (depthLoadPromise) return depthLoadPromise;
     depthLoading = true;
@@ -133,21 +138,42 @@
 
       _updateStatus('downloading');
 
-      depthPipeline = await pipeline(
-        'depth-estimation',
-        'onnx-community/depth-anything-v2-small-hf',
-        { dtype: 'fp32', device: 'wasm' }
-      );
+      const preferredDevice = options.device || CFG.device || (navigator.gpu ? 'webgpu' : 'wasm');
+      const preferredDtype  = options.dtype || CFG.dtype || (preferredDevice === 'webgpu' ? 'fp32' : 'q8');
+
+      try {
+        if (preferredDevice === 'webgpu') {
+          depthPipeline = await pipeline(
+            'depth-estimation',
+            'onnx-community/depth-anything-v2-small-hf',
+            { dtype: 'fp32', device: 'webgpu' }
+          );
+          activeDevice = 'webgpu';
+        } else {
+          throw new Error('Fallback to WASM requested');
+        }
+      } catch (gpuErr) {
+        if (window.VisionGuideConfig?.debug) {
+          console.info('[VisionGuide Depth] WebGPU unavailable or failed, falling back to WASM q8:', gpuErr.message);
+        }
+        depthPipeline = await pipeline(
+          'depth-estimation',
+          'onnx-community/depth-anything-v2-small-hf',
+          { dtype: preferredDtype || 'q8', device: 'wasm' }
+        );
+        activeDevice = 'wasm';
+      }
 
       depthLoaded  = true;
       depthLoading = false;
       _updateStatus('ready');
-      if (window.VisionGuideConfig?.debug) console.info('[VisionGuide Depth] Depth-Anything-V2 ready');
+      if (window.VisionGuideConfig?.debug) console.info(`[VisionGuide Depth] Depth-Anything-V2 ready on ${activeDevice}`);
       return depthPipeline;
 
     } catch (err) {
       depthError   = err.message || 'Model failed to load';
       depthLoading = false;
+      activeDevice = 'none';
       _updateStatus('error');
       if (window.VisionGuideConfig?.debug) console.warn('[VisionGuide Depth] Model load failed — using heuristic:', err.message);
       return null;
@@ -191,9 +217,10 @@
     loopGeneration++;
   }
 
-  function _scheduleDepth() {
+  function _scheduleDepth(delay = LOOP_INTERVAL) {
     if (!loopActive) return;
-    loopTimer = setTimeout(_runDepthFrame, LOOP_INTERVAL);
+    clearTimeout(loopTimer);
+    loopTimer = setTimeout(_runDepthFrame, delay);
   }
 
   async function _runDepthFrame() {
@@ -207,11 +234,19 @@
       return;
     }
 
+    // Cooperative scheduling: If surface segmentation or other heavy model is running, postpone!
+    if (window.VisionGuidePipelineBusy) {
+      _scheduleDepth(300);
+      return;
+    }
+
+    window.VisionGuidePipelineBusy = true;
     try {
-      // 1. Capture video frame
+      // 1. Capture video frame (scale to mobile budget: 384 max edge)
       const vw = frameVideo.videoWidth;
       const vh = frameVideo.videoHeight;
-      const scale = Math.min(1, (CFG.maxInputEdge || 518) / Math.max(vw, vh));
+      const maxEdge = CFG.maxInputEdge || 384;
+      const scale = Math.min(1, maxEdge / Math.max(vw, vh));
       const inputW = Math.max(1, Math.round(vw * scale));
       const inputH = Math.max(1, Math.round(vh * scale));
       if (frameCanvas.width !== inputW) frameCanvas.width = inputW;
@@ -239,23 +274,31 @@
         } else { tensor.dispose?.(); throw new Error('Depth model returned unsupported dimensions'); }
         if (!depthW || !depthH || depthW * depthH > raw.length) { tensor.dispose?.(); throw new Error('Depth tensor dimensions are invalid'); }
 
-        // Robust per-frame normalization. Depth Anything V2 produces relative
-        // inverse depth (larger prediction = closer), not calibrated metres.
-        const sampled = [];
+        // Robust per-frame normalization using reusable pre-allocated buffer (zero GC)
         const stride = Math.max(1, Math.floor(raw.length / 4096));
-        for (let i = 0; i < raw.length; i += stride) if (Number.isFinite(raw[i])) sampled.push(raw[i]);
-        if (!sampled.length) { tensor.dispose?.(); throw new Error('Depth model returned no finite values'); }
-        sampled.sort((a,b) => a-b);
-        const q = p => sampled[Math.min(sampled.length-1, Math.max(0, Math.floor((sampled.length-1)*p)))];
+        let count = 0;
+        for (let i = 0; i < raw.length && count < 4096; i += stride) {
+          if (Number.isFinite(raw[i])) sampledBuffer[count++] = raw[i];
+        }
+        if (count === 0) { tensor.dispose?.(); throw new Error('Depth model returned no finite values'); }
+        const slice = sampledBuffer.subarray(0, count).sort();
+        const q = p => slice[Math.min(count - 1, Math.max(0, Math.floor((count - 1) * p)))];
         depthSceneMin = q(CFG.lowQuantile ?? 0.05);
         depthSceneMax = q(CFG.highQuantile ?? 0.95);
-        depthData     = new Float32Array(raw);
+
+        // Reuse pre-allocated Float32Array to eliminate 1MB heap allocation on every frame
+        if (!depthData || depthData.length !== raw.length) {
+          depthData = new Float32Array(raw.length);
+        }
+        depthData.set(raw);
         depthTimestamp = Date.now();
         tensor.dispose?.();
       }
     } catch (err) {
       depthError = err.message || 'Depth inference failed';
       if (window.VisionGuideConfig?.debug) console.warn('[VisionGuide Depth] Frame error:', err.message);
+    } finally {
+      window.VisionGuidePipelineBusy = false;
     }
 
     _scheduleDepth();

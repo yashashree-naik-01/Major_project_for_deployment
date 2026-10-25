@@ -43,23 +43,28 @@
   const HIST_MS = CFG.historyMs || 8000;
 
   /* ─── Safe-direction announcement throttle ───────────────────── */
-  let _prevDir     = null;
-  let _prevDirTime = 0;
-  let _stableDir = null;
-  let _candidateDir = null;
+  let _prevDir        = null;
+  let _prevDirTime    = 0;
+  let _prevHazardKey  = null;
+  let _prevHazardTime = 0;
+  let _stableDir      = null;
+  let _candidateDir   = null;
   let _candidateFrames = 0;
-  const DIR_REPEAT = CFG.directionRepeatMs || 7000;
-  const DIR_CHANGE = 1200;
+  const DIR_REPEAT    = CFG.directionRepeatMs || 7000;
+  const DIR_CHANGE    = 1200;
+  const HAZARD_REPEAT = CFG.hazardRepeatMs || 9000;
 
   /* ─── Public API ─────────────────────────────────────────────── */
   window.riskAPI = {
     enrich,           // (tracks, videoW, videoH) → enriched + sorted tracks
     computeSafeDir,   // (enrichedTracks, freeSpaceResult, videoW, videoH) → guidance
+    validateLateralPath: _validateLateralPath,
     shouldAnnounceDir,
     markDirSent,
     reset: () => {
       _hist.clear(); _prevDir = null; _prevDirTime = 0;
       _stableDir = null; _candidateDir = null; _candidateFrames = 0;
+      _prevHazardKey = null; _prevHazardTime = 0;
     },
   };
 
@@ -246,20 +251,49 @@
         - ({ danger: 35, close: 22, medium: 8, far: 0 }[zone.closestDepth] ?? 0);
     }
 
+    // ── Incorporate ground hazard (drop-off, stairs, drain, pothole, curb, raised, broken) ──
+    const hazard = freeSpaceResult?.hazard || null;
+    if (hazard && (hazard.type || hazard.category)) {
+      const hazardType = hazard.category || hazard.type;
+      const hazardCells = hazard.cells || [];
+      const hasCenterHazard = hazardCells.length === 0 || hazardCells.some(c => c.c >= 1 && c.c <= 3);
+      if (hasCenterHazard) {
+        const hazardPenalty = hazardType === 'uncovered-drain'
+          ? (hazard.confidence === 'confident' ? 65 : 45)
+          : hazardType === 'dropoff'
+          ? (hazard.confidence === 'confident' ? 60 : 35)
+          : hazardType === 'stairs-down'
+          ? (hazard.confidence === 'confident' ? 55 : 35)
+          : hazardType === 'pothole'
+          ? (hazard.confidence === 'confident' ? 45 : 30)
+          : hazardType === 'curb'
+          ? (hazard.confidence === 'confident' ? 35 : 20)
+          : hazardType === 'raised-surface'
+          ? (hazard.confidence === 'confident' ? 35 : 20)
+          : hazardType === 'broken-pavement'
+          ? (hazard.confidence === 'confident' ? 30 : 15)
+          : (hazard.confidence === 'confident' ? 30 : 20);
+        ZONES.center.safetyScore -= hazardPenalty;
+      }
+    }
+
     // ── Choose direction ─────────────────────────────────────────
     const sorted = Object.entries(ZONES).sort(([,a],[,b]) => b.safetyScore - a.safetyScore);
     const [bestKey, bestZone] = sorted[0];
 
-    // Prefer going straight if centre is within 12 pts of best
-    const centreSafe = ZONES.center.safetyScore >= bestZone.safetyScore - (CFG.directionMargin || 12);
-    const allBlocked = Object.values(ZONES).every(zone => zone.freePct < (CFG.blockedFreePercent ?? 35));
-    const rawDir = allBlocked ? 'stop' : centreSafe ? 'center' : bestKey;
+    // For imminent ground hazards (drains, drop-offs, descending stairs), stop or approach with extreme caution
+    const hType = hazard?.category || hazard?.type;
+    const isImminentHazard = (hType === 'uncovered-drain' || hType === 'dropoff' || hType === 'stairs-down') && hazard?.confidence === 'confident';
+    const centreSafe = !isImminentHazard && (ZONES.center.safetyScore >= bestZone.safetyScore - (CFG.directionMargin || 12));
+    const allBlocked = Object.values(ZONES).every(zone => zone.freePct < (CFG.blockedFreePercent ?? 35)) ||
+                       (isImminentHazard && bestZone.safetyScore < 20);
+    const rawDir = allBlocked ? 'stop' : (isImminentHazard ? (hType === 'stairs-down' || hType === 'uncovered-drain' ? 'stop' : bestKey) : (centreSafe ? 'center' : bestKey));
     const finalDir = _stabilizeDirection(rawDir, ZONES);
 
-    const speech = _buildSpeech(finalDir, ZONES);
+    const speech = _buildSpeech(finalDir, ZONES, hazard, freeSpaceResult);
     const orderedScores = Object.values(ZONES).map(z=>z.safetyScore).sort((a,b)=>b-a);
     const confidence = Math.max(0, Math.min(1, ((orderedScores[0]||0)-(orderedScores[1]||0))/35));
-    return { direction: finalDir, rawDirection: rawDir, speech, zones: ZONES, confidence };
+    return { direction: finalDir, rawDirection: rawDir, speech, zones: ZONES, confidence, hazard };
   }
 
   function _stabilizeDirection(rawDir, zones) {
@@ -294,10 +328,163 @@
     }, 'far');
   }
 
-  function _buildSpeech(dir, zones) {
+  /**
+   * Validates whether the entire proposed lateral path (left or right corridor)
+   * is adequately free of obstacles, ground hazards, surface barriers, and
+   * unverified terrain.
+   *
+   * @param {string} side — 'left' | 'right'
+   * @param {Object} zones — { left, center, right }
+   * @param {Object} [freeSpaceResult]
+   * @returns {boolean}
+   */
+  function _validateLateralPath(side, zones, freeSpaceResult) {
+    if (side !== 'left' && side !== 'right') return false;
+    const zone = zones?.[side];
+    if (!zone) return false;
+
+    // 1. Zone must have sufficient estimated open space (default >= 65%)
+    const minFreePct = CFG.lateralMinFreePercent ?? 65;
+    if (zone.freePct < minFreePct) return false;
+
+    // 2. No high-risk, danger-proximity, or fast-approaching obstacles in proposed zone
+    const dangerousTrack = zone.tracks?.some(t =>
+      t.risk?.level === 'high' ||
+      t.distInfo?.zone === 'danger' ||
+      t.motion?.trajectory === 'approaching'
+    );
+    if (dangerousTrack) return false;
+
+    // 3. Hazard boundaries must not intersect the proposed lateral corridor
+    const hazard = freeSpaceResult?.hazard;
+    if (hazard && Array.isArray(hazard.cells) && hazard.cells.length > 0) {
+      const lateralCols = side === 'left' ? [0, 1] : [3, 4];
+      const hazardInCorridor = hazard.cells.some(c => lateralCols.includes(c.c));
+      if (hazardInCorridor) return false;
+    }
+
+    // 4. Detailed grid inspection (near and mid rows)
+    if (freeSpaceResult?.grid && Array.isArray(freeSpaceResult.grid)) {
+      const grid = freeSpaceResult.grid;
+      const lateralCols = side === 'left' ? [0, 1] : [3, 4];
+      const corridorCells = grid.filter(c => (c.r === 1 || c.r === 2) && lateralCols.includes(c.c));
+
+      if (corridorCells.length > 0) {
+        // Disallow any corridor cell with an obstacle, dropoff, or caution status
+        const hasBlockage = corridorCells.some(c =>
+          c.status === 'obstacle' ||
+          c.status === 'dropoff' ||
+          c.status === 'caution'
+        );
+        if (hasBlockage) return false;
+
+        // Disallow unsafe surface types (walls, roads, stairs)
+        const hasUnsafeSurface = corridorCells.some(c =>
+          c.surfaceCategory === 'wall' ||
+          c.surfaceCategory === 'road' ||
+          c.surfaceCategory === 'stairs'
+        );
+        if (hasUnsafeSurface) return false;
+
+        // Safety rule: Unknown observations must not be interpreted as proof of safety!
+        const allUnknown = corridorCells.every(c =>
+          (c.surfaceCategory === 'unknown' || !c.surfaceCategory) &&
+          (!c.surfaceConfidence || c.surfaceConfidence < 0.25)
+        );
+        if (allUnknown && (!window.depthAPI || !window.depthAPI.isLoaded?.())) {
+          return false;
+        }
+      }
+    }
+
+    return true;
+  }
+
+  function _buildSpeech(dir, zones, hazard, freeSpaceResult) {
     const cZ       = zones.center;
     const highObjs = cZ.tracks.filter(t => t.risk.level === 'high');
     const medObjs  = cZ.tracks.filter(t => t.risk.level !== 'low');
+    const isLateral = dir === 'left' || dir === 'right';
+    const pathValidated = isLateral ? _validateLateralPath(dir, zones, freeSpaceResult) : false;
+    const dirWord = dir === 'left' ? 'left' : dir === 'right' ? 'right' : '';
+
+    // ── FEATURE 4 & Specialized Ground Hazard Speech ─────────────
+    if (hazard && (hazard.type || hazard.category)) {
+      const type = hazard.category || hazard.type;
+
+      // Uncovered Drain (Critical)
+      if (type === 'uncovered-drain') {
+        if (hazard.confidence === 'uncertain') {
+          return 'Possible uncovered drain ahead. Proceed with caution.';
+        }
+        return (dirWord && pathValidated)
+          ? `Uncovered drain detected ahead. The ${dirWord} side appears clearer.`
+          : 'Uncovered drain detected ahead. Please stop.';
+      }
+
+      // Pothole (High)
+      if (type === 'pothole') {
+        if (hazard.confidence === 'uncertain') {
+          return 'Possible pothole ahead.';
+        }
+        return (dirWord && pathValidated)
+          ? `Pothole detected ahead. The ${dirWord} side appears clearer.`
+          : 'Pothole detected ahead. Step carefully.';
+      }
+
+      // Curb edge
+      if (type === 'curb') {
+        if (hazard.confidence === 'uncertain') {
+          return 'Possible curb edge ahead.';
+        }
+        return 'Curb edge ahead. Step carefully.';
+      }
+
+      // Raised surface
+      if (type === 'raised-surface') {
+        if (hazard.confidence === 'uncertain') {
+          return 'Possible raised surface ahead.';
+        }
+        return 'Raised surface ahead. Watch your step.';
+      }
+
+      // Broken pavement
+      if (type === 'broken-pavement') {
+        if (hazard.confidence === 'uncertain') {
+          return 'Possible uneven pavement ahead.';
+        }
+        return 'Uneven, broken pavement ahead. Watch your footing.';
+      }
+
+      // Drop-off
+      if (type === 'dropoff') {
+        if (hazard.confidence === 'uncertain') {
+          return (dirWord && pathValidated)
+            ? `Possible drop-off ahead. The ${dirWord} side appears clearer.`
+            : 'Possible drop-off ahead. Proceed with caution.';
+        } else {
+          return dir === 'stop'
+            ? 'Drop-off detected ahead. Stop and check your step.'
+            : (dirWord && pathValidated)
+            ? `Drop-off detected ahead. The ${dirWord} side appears clearer.`
+            : 'Drop-off detected ahead. Stop and check your surroundings.';
+        }
+      } else if (type === 'stairs-down') {
+        if (hazard.confidence === 'uncertain') {
+          return 'Possible descending stairs ahead. Stop and check.';
+        } else {
+          return 'Descending stairs ahead. Stop and check your step.';
+        }
+      } else if (type === 'stairs-up') {
+        if (hazard.confidence === 'uncertain') {
+          return 'Possible steps ahead. Approach cautiously.';
+        } else {
+          return 'Stairs ahead leading up. Approach carefully.';
+        }
+      } else if (type === 'stairs-ambiguous') {
+        return 'Possible steps ahead. Approach cautiously.';
+      }
+    }
 
     if (dir === 'stop') return 'Obstacle patterns are detected across the view. Stop and check your surroundings.';
 
@@ -310,7 +497,7 @@
     }
 
     if (noTrackedObjects) {
-      if (dir === 'left' || dir === 'right') return `An obstacle pattern is detected ahead. The ${dir} side appears clearer.`;
+      if (isLateral && pathValidated) return `An obstacle pattern is detected ahead. The ${dir} side appears clearer.`;
       return 'An unclassified obstacle pattern may be ahead. Proceed with caution.';
     }
 
@@ -321,33 +508,71 @@
       return 'Centre path is safest. Proceed carefully.';
     }
 
-    const dirWord = dir === 'left' ? 'left' : 'right';
-
     // High risk in centre
     if (highObjs.length) {
       const name = _cap(highObjs[0].label);
       const mot  = highObjs[0].motion?.trajectory;
       const motWord = mot === 'approaching' ? ', approaching fast' : '';
-      return `${name} ahead${motWord} — high risk. Move ${dirWord}. The ${dirWord} side appears clearer.`;
+      if (pathValidated) {
+        return `${name} ahead${motWord} — high risk. Move ${dirWord}. The ${dirWord} side appears clearer.`;
+      }
+      return `${name} ahead${motWord} — high risk. Check your surroundings before stepping aside.`;
     }
 
     // Medium risk in centre
     if (medObjs.length) {
-      return `Obstacle ahead. Move slightly ${dirWord}. The ${dirWord} path appears safer.`;
+      if (pathValidated) {
+        return `Obstacle ahead. Move slightly ${dirWord}. The ${dirWord} path appears safer.`;
+      }
+      return 'Obstacle directly ahead. Check your surroundings before stepping aside.';
     }
 
     // Centre clear but other zones are safer
-    return `${dir === 'left' ? 'Left' : 'Right'} path appears clearest. Move slightly ${dirWord}.`;
+    if (pathValidated) {
+      return `${dir === 'left' ? 'Left' : 'Right'} path appears clearest. Move slightly ${dirWord}.`;
+    }
+    return 'No tracked obstacle is in the centre. Continue carefully.';
   }
 
   /* ── Announcement throttle ────────────────────────────────────── */
-  function shouldAnnounceDir(dir) {
-    const now = Date.now(), e = now - _prevDirTime;
+  function shouldAnnounceDir(dir, hazard) {
+    const now = Date.now();
+    const hazardType = hazard?.category || hazard?.type;
+    const hazardKey = hazardType ? `${hazardType}:${hazard.confidence}` : null;
+
+    // 1. Newly detected hazard or escalated confidence -> announce immediately!
+    if (hazardKey && hazardKey !== _prevHazardKey) {
+      return true;
+    }
+
+    // 2. Persistent identical hazard -> throttle to prevent repetitive speech alerts
+    if (hazardKey && hazardKey === _prevHazardKey) {
+      const hazardElapsed = now - _prevHazardTime;
+      // Allow directional update if user should steer or stop
+      if (dir !== _prevDir && (now - _prevDirTime > DIR_CHANGE)) return true;
+      return hazardElapsed > HAZARD_REPEAT;
+    }
+
+    // 3. Hazard cleared -> allow announcing normal direction update
+    if (!hazardKey && _prevHazardKey) {
+      return (now - _prevDirTime) > DIR_CHANGE;
+    }
+
+    // 4. Normal direction throttle
+    const e = now - _prevDirTime;
     if (dir !== _prevDir && e > DIR_CHANGE) return true;
     if (dir === _prevDir && e > DIR_REPEAT)  return true;
     return false;
   }
-  function markDirSent(dir) { _prevDir = dir; _prevDirTime = Date.now(); }
+
+  function markDirSent(dir, hazard) {
+    _prevDir = dir;
+    _prevDirTime = Date.now();
+    const hazardType = hazard?.category || hazard?.type;
+    const hazardKey = hazardType ? `${hazardType}:${hazard.confidence}` : null;
+    _prevHazardKey = hazardKey;
+    if (hazardKey) _prevHazardTime = Date.now();
+  }
 
   /* ─── Helpers ────────────────────────────────────────────────── */
   function _cap(s) { return s ? s[0].toUpperCase() + s.slice(1) : ''; }

@@ -83,7 +83,7 @@ async function waitForServer(url) {
   const app = spawn(process.execPath, ['server.cjs'], { windowsHide: true, stdio: 'ignore', env: {
     ...process.env, PORT: String(appPort), NOMINATIM_URL: `http://127.0.0.1:${upstreamPort}/nominatim`,
     PHOTON_URL: `http://127.0.0.1:${upstreamPort}/photon`, VALHALLA_URL: `http://127.0.0.1:${upstreamPort}/valhalla`,
-    OSRM_FOOT_URL: `http://127.0.0.1:${upstreamPort}/osrm`
+    OSRM_FOOT_URL: `http://127.0.0.1:${upstreamPort}/osrm`, GEOAPIFY_API_KEY: '', GRAPHHOPPER_API_KEY: ''
   } });
   try {
     await waitForServer(`http://127.0.0.1:${appPort}/`);
