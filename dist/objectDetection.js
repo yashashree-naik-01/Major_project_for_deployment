@@ -127,7 +127,13 @@
     window.freeSpaceAPI?.reset?.();
     window.sceneStateAPI?.begin?.();
 
-    loadModel().then(model => {
+if (window.stairDetectorAPI?.loadModel) {
+  window.stairDetectorAPI.loadModel().catch(err =>
+    console.warn('Stair detector initialization failed:', err)
+  );
+} 
+    
+	loadModel().then(model => {
       if (model && detectionActive && generation === runGeneration) _schedule(0);
     });
   }
@@ -173,7 +179,16 @@
     try {
       // ── 1. COCO-SSD raw detections ─────────────────────────────
       _emitBadge('od-status-badge', 'Processing current scene…', 'od-badge-loading');
-      const raw = await cocoModel.detect(frameVideo, CFG.maxBoxes || 20, CFG.minConfidence ?? 0.45);
+     const raw = await cocoModel.detect(frameVideo, CFG.maxBoxes || 20, CFG.minConfidence ?? 0.45);
+
+let stairHazards = [];
+if (window.stairDetectorAPI?.isModelLoaded?.()) {
+  try {
+    stairHazards = await window.stairDetectorAPI.detect(frameVideo);
+  } catch (err) {
+    console.warn('Stair detection failed:', err);
+  }
+}
       if (!detectionActive || generation !== runGeneration) return;
       if (frameVideo !== videoEl) { _schedule(0); return; }
 
@@ -199,9 +214,27 @@
         : null;
 
       // ── 6. Safe direction ──────────────────────────────────────
-      const safeDir = window.riskAPI
-        ? window.riskAPI.computeSafeDir(withRisk, freeSpace, vw, vh)
-        : null;
+     let safeDir = window.riskAPI
+  ? window.riskAPI.computeSafeDir(withRisk, freeSpace, vw, vh)
+  : null;
+
+if (stairHazards.length > 0) {
+  const stair = stairHazards[0];
+
+  if (safeDir && stair) {
+    safeDir = {
+      ...safeDir,
+      direction: 'stop',
+      hazard: {
+        ...stair,
+        type: stair.category,
+        label: stair.label,
+        alertMessage: stair.alertMessage
+      },
+      speech: stair.alertMessage || 'Possible stairs ahead. Stop and check your step.'
+    };
+  }
+}
 
       const processingMs = (typeof performance !== 'undefined' && performance.now ? performance.now() : Date.now()) - started;
       latestPipelineResult = { tracks: withRisk, freeSpace, safeDir, time: Date.now(), videoWidth: vw, videoHeight: vh };

@@ -32,9 +32,18 @@ loadLocalEnvironment();
 const root = path.join(__dirname, 'dist');
 const mapLibreRoot = path.join(__dirname, 'node_modules', 'maplibre-gl', 'dist');
 const supabaseBrowserFile = path.join(__dirname, 'node_modules', '@supabase', 'supabase-js', 'dist', 'umd', 'supabase.js');
+const ortRoot = path.join(__dirname, 'node_modules', 'onnxruntime-web', 'dist');
 const port = Number(process.env.PORT || 4173);
 const host = process.env.HOST || '0.0.0.0';
-const types = { '.html': 'text/html; charset=utf-8', '.css': 'text/css; charset=utf-8', '.js': 'text/javascript; charset=utf-8', '.mjs': 'text/javascript; charset=utf-8', '.map': 'application/json' };
+const types = {
+  '.html': 'text/html; charset=utf-8',
+  '.css': 'text/css; charset=utf-8',
+  '.js': 'text/javascript; charset=utf-8',
+  '.mjs': 'text/javascript; charset=utf-8',
+  '.map': 'application/json',
+  '.wasm': 'application/wasm',
+  '.onnx': 'application/octet-stream'
+};
 const graphHopperKey = process.env.GRAPHHOPPER_API_KEY || '';
 const graphHopperUrl = process.env.GRAPHHOPPER_URL || 'https://graphhopper.com/api/1/route';
 const geoapifyKey = process.env.GEOAPIFY_API_KEY || '';
@@ -585,6 +594,17 @@ const server = http.createServer((req, res) => {
     fs.readFile(supabaseBrowserFile, (error, data) => {
       if (error) { res.writeHead(404).end('File not found'); return; }
       res.writeHead(200, { 'Content-Type': 'text/javascript; charset=utf-8', 'Cache-Control': 'public, max-age=86400' });
+      res.end(req.method === 'HEAD' ? undefined : data);
+    });
+    return;
+  }
+  if (name.startsWith('/vendor/onnxruntime/')) {
+    const ortName = name.slice('/vendor/onnxruntime/'.length);
+    const ortFile = path.resolve(ortRoot, ortName);
+    if (!ortFile.startsWith(ortRoot + path.sep)) { res.writeHead(403).end('Not allowed'); return; }
+    fs.readFile(ortFile, (error, data) => {
+      if (error) { res.writeHead(404).end('File not found'); return; }
+      res.writeHead(200, { 'Content-Type': types[path.extname(ortFile)] || 'application/octet-stream', 'Cache-Control': 'public, max-age=86400' });
       res.end(req.method === 'HEAD' ? undefined : data);
     });
     return;
