@@ -211,12 +211,6 @@
 
     const hazard = freeSpaceResult?.hazard || null;
 
-    // Check if walking surface can be assessed at all (Requirement 9)
-    if (freeSpaceResult?.surfaceUnassessed) {
-      const stopSpeech = 'Unable to assess the walking surface. Stop and proceed only after checking with an established mobility aid or a sighted assistant.';
-      return { direction: 'stop', rawDirection: 'stop', speech: stopSpeech, zones: ZONES, confidence: 0, hazard, surfaceUnassessed: true };
-    }
-
     // ── Populate zones & evaluate traversability (Requirements 1, 2, 3, 4, 6, 7) ──
     for (const [, zone] of Object.entries(ZONES)) {
       const [xMin, xMax] = zone.xRange;
@@ -309,6 +303,12 @@
         - (topCat === 'wall' ? 45 : 0)
         - (topCat === 'road' ? 35 : 0)
         + (isSurfaceWalkable ? 8 : 0);
+    }
+
+    // Check if walking surface can be assessed at all (Requirement 9)
+    if (freeSpaceResult?.surfaceUnassessed) {
+      const stopSpeech = 'Unable to assess the walking surface. Stop and proceed only after checking with an established mobility aid or a sighted assistant.';
+      return { direction: 'stop', rawDirection: 'stop', speech: stopSpeech, zones: ZONES, confidence: 0, hazard, surfaceUnassessed: true };
     }
 
     // ── Incorporate ground hazard (drop-off, stairs, drain, pothole, curb, raised, broken) ──

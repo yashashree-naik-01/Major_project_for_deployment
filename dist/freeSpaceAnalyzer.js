@@ -161,7 +161,10 @@
 
     const nearMidCells = smoothedGrid.filter(c => c.r >= 1);
     const hasAnyGroundEvidence = nearMidCells.some(c => c.verifiedWalkable || c.status === 'obstacle' || c.status === 'dropoff');
-    const surfaceUnassessed = !hasAnyGroundEvidence && (!dm || !dm.data);
+    const isModelLoaded = Boolean(window.depthAPI?.isLoaded?.() || window.surfaceSegmentationAPI?.isLoaded?.());
+    const isCameraDegraded = window.sceneStateAPI?.getSnapshot?.()?.status === 'degraded';
+    // Surface is unassessed when models are active or camera is degraded, but ground cannot be identified at all (e.g. covered lens, pitch darkness, looking at sky/ceiling)
+    const surfaceUnassessed = Boolean((isCameraDegraded || (isModelLoaded && dm && dm.data)) && !hasAnyGroundEvidence);
 
     const advice = _computeAdvice(smoothedGrid, hazard);
     return { grid: smoothedGrid, advice, hazard, surface: sm, surfaceUnassessed, COLS, ROWS };
@@ -182,7 +185,8 @@
           r, c,
           x: 0, y: 0, w: 0, h: 0,
           status: 'clear', zone: null, src: null, label: null, trackId: null,
-          surfaceCategory: 'unknown', surfaceConfidence: 0, surfaceShares: null
+          surfaceCategory: 'unknown', surfaceConfidence: 0, surfaceShares: null,
+          depthGroundConfirmed: false, surfaceGroundConfirmed: false
         };
       }
     }
@@ -202,6 +206,8 @@
       cell.surfaceCategory = 'unknown';
       cell.surfaceConfidence = 0;
       cell.surfaceShares = null;
+      cell.depthGroundConfirmed = false;
+      cell.surfaceGroundConfirmed = false;
     }
     return _gridPool;
   }
