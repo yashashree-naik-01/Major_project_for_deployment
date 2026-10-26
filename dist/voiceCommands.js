@@ -17,6 +17,11 @@
   let running = false;
   let pausedForSpeech = false;
   let restartTimer = null;
+  let expectingDestination = false;
+
+  function expectDestination() {
+    expectingDestination = true;
+  }
 
   function update(state, message, heard = '') {
     if (root) root.dataset.state = state;
@@ -183,9 +188,46 @@
     if (pageMatch && pageCommands[pageMatch[1]]) {
       app.goTo(pageCommands[pageMatch[1]]); return;
     }
+    if (/^(emergency|sos|help me)$/.test(command)) {
+      expectingDestination = false;
+      app.emergency(); return;
+    }
+    if (/^(confirm emergency|confirm sos|activate (the )?(emergency|sos)( alert)?)$/.test(command)) {
+      expectingDestination = false;
+      await app.confirmEmergency(); return;
+    }
+    if (/^(cancel emergency|cancel sos|stop (the )?(emergency|sos)( alert)?)$/.test(command)) {
+      expectingDestination = false;
+      app.cancelEmergency(); return;
+    }
+
+    if (expectingDestination) {
+      expectingDestination = false;
+      const cleanDest = command.replace(/^(?:navigate|take me|go|head)\s+to\s+/i, '').replace(/^(?:to|destination)\s+/i, '').trim() || String(input).trim();
+      if (cleanDest) {
+        await app.navigateTo(cleanDest);
+        return;
+      }
+    }
+
     const destination = command.match(/^(?:navigate|take me|go) to (.+)$/);
     if (destination) {
       await app.navigateTo(destination[1]); return;
+    }
+    const navDestination = command.match(/^(?:destination|to) (.+)$/);
+    if (navDestination && (document.querySelector('.page-navigate') || document.activeElement?.id === 'destination-search')) {
+      await app.navigateTo(navDestination[1]); return;
+    }
+    if (document.activeElement?.id === 'destination-search' && command.length > 2) {
+      await app.navigateTo(command); return;
+    }
+    const originMatch = command.match(/^(?:set start|start from|origin) (.+)$/);
+    if (originMatch && window.navigationUI) {
+      const originQuery = originMatch[1].trim();
+      const originInput = document.getElementById('origin-search');
+      if (originInput) originInput.value = originQuery;
+      await window.navigationUI.searchOrigin(originQuery);
+      return;
     }
     const resultChoice = command.match(/^(?:select|choose) (?:result )?(\d+)$/) ||
       command.match(/^(?:select|choose) (first|second|third|fourth|fifth) result$/);
@@ -201,15 +243,6 @@
       if (window.navigationUI?.isActive?.()) window.navigationUI.stop();
       else app.speak('There is no active navigation to stop.');
       return;
-    }
-    if (/^(emergency|sos|help me)$/.test(command)) {
-      app.emergency(); return;
-    }
-    if (/^(confirm emergency|confirm sos|activate (the )?(emergency|sos)( alert)?)$/.test(command)) {
-      await app.confirmEmergency(); return;
-    }
-    if (/^(cancel emergency|cancel sos|stop (the )?(emergency|sos)( alert)?)$/.test(command)) {
-      app.cancelEmergency(); return;
     }
     if (/^(repeat|say that again|repeat instruction|again)$/.test(command)) {
       app.repeat(); return;
@@ -252,6 +285,7 @@
     stop: turnOff,
     pauseForSpeech,
     resumeAfterSpeech,
+    expectDestination,
     execute,
     isEnabled: () => enabled,
     isListening: () => running

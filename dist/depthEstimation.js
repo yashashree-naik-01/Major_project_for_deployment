@@ -55,59 +55,59 @@
   };
 
   /* ─── State ─────────────────────────────────────────────────── */
-  let depthPipeline   = null;
-  let depthLoading    = false;
-  let depthLoaded     = false;
-  let depthError      = null;
+  let depthPipeline = null;
+  let depthLoading = false;
+  let depthLoaded = false;
+  let depthError = null;
   let depthLoadPromise = null;
-  let activeDevice    = 'none';
+  let activeDevice = 'none';
 
   // Pre-allocated reusable quantile sampling buffer (4096 elements = 16KB, 0 GC churn)
   const sampledBuffer = new Float32Array(4096);
 
   // Current depth map data
-  let depthData       = null;   // Reusable Float32Array from Depth-Anything-V2
-  let depthW          = 0;
-  let depthH          = 0;
-  let depthSceneMin   = 0;
-  let depthSceneMax   = 1;
-  let depthTimestamp  = 0;      // when was the last depth map computed
+  let depthData = null;   // Reusable Float32Array from Depth-Anything-V2
+  let depthW = 0;
+  let depthH = 0;
+  let depthSceneMin = 0;
+  let depthSceneMax = 1;
+  let depthTimestamp = 0;      // when was the last depth map computed
 
   // Loop state
-  let loopActive      = false;
-  let loopTimer       = null;
-  let loopVideo       = null;
-  let loopGeneration  = 0;
+  let loopActive = false;
+  let loopTimer = null;
+  let loopVideo = null;
+  let loopGeneration = 0;
   const LOOP_INTERVAL = CFG.intervalMs || 3000;
 
   // Scratch canvas for frame capture (reused)
-  let frameCanvas     = null;
-  let frameCtx        = null;
-  const trackDepth    = new Map();
+  let frameCanvas = null;
+  let frameCtx = null;
+  const trackDepth = new Map();
 
   /* ─── Public API ─────────────────────────────────────────────── */
   window.depthAPI = {
-    loadModel:           loadModel,
-    startDepthLoop:      startDepthLoop,
-    stopDepthLoop:       stopDepthLoop,
-    getDistanceForBBox:  getDistanceForBBox,
-    getZones:            () => ZONES,
-    isLoaded:            () => depthLoaded,
-    isLoading:           () => depthLoading,
-    getDevice:           () => activeDevice,
-    hasDepthMap:         () => Boolean(depthData && depthTimestamp && Date.now() - depthTimestamp <= (CFG.staleAfterMs || 6500)),
-    getDepthAge:         () => depthTimestamp ? Date.now() - depthTimestamp : Infinity,
-    getError:            () => depthError,
-    isActive:            () => loopActive,
+    loadModel: loadModel,
+    startDepthLoop: startDepthLoop,
+    stopDepthLoop: stopDepthLoop,
+    getDistanceForBBox: getDistanceForBBox,
+    getZones: () => ZONES,
+    isLoaded: () => depthLoaded,
+    isLoading: () => depthLoading,
+    getDevice: () => activeDevice,
+    hasDepthMap: () => Boolean(depthData && depthTimestamp && Date.now() - depthTimestamp <= (CFG.staleAfterMs || 6500)),
+    getDepthAge: () => depthTimestamp ? Date.now() - depthTimestamp : Infinity,
+    getError: () => depthError,
+    isActive: () => loopActive,
     pruneTracks: ids => {
       const active = new Set(ids || []);
       trackDepth.forEach((_, id) => { if (!active.has(id)) trackDepth.delete(id); });
     },
     // Raw depth map for free-space analysis
     getDepthMap: () => depthData && depthTimestamp && Date.now() - depthTimestamp <= (CFG.staleAfterMs || 6500) ? {
-      data:     depthData,
-      width:    depthW,
-      height:   depthH,
+      data: depthData,
+      width: depthW,
+      height: depthH,
       sceneMin: depthSceneMin,
       sceneMax: depthSceneMax,
     } : null,
@@ -121,65 +121,67 @@
     if (depthLoaded) return depthPipeline;
     if (depthLoadPromise) return depthLoadPromise;
     depthLoading = true;
-    depthError   = null;
+    depthError = null;
     _updateStatus('loading');
 
-    depthLoadPromise = (async () => { try {
-      // Dynamic ESM import — works in all modern browsers
-      const transformers = await import(
-        'https://cdn.jsdelivr.net/npm/@huggingface/transformers@3.0.2/dist/transformers.esm.min.js'
-      );
-      const { pipeline, env } = transformers;
-
-      // Browser cache so model only downloads once
-      env.allowLocalModels   = false;
-      env.useBrowserCache    = true;
-      env.backends.onnx.wasm.proxy = false;
-
-      _updateStatus('downloading');
-
-      const preferredDevice = options.device || CFG.device || (navigator.gpu ? 'webgpu' : 'wasm');
-      const preferredDtype  = options.dtype || CFG.dtype || (preferredDevice === 'webgpu' ? 'fp32' : 'q8');
-
+    depthLoadPromise = (async () => {
       try {
-        if (preferredDevice === 'webgpu') {
+        // Dynamic ESM import — works in all modern browsers
+        const transformers = await import(
+          'https://cdn.jsdelivr.net/npm/@huggingface/transformers@3.0.2'
+        );
+        const { pipeline, env } = transformers;
+
+        // Browser cache so model only downloads once
+        env.allowLocalModels = false;
+        env.useBrowserCache = true;
+        env.backends.onnx.wasm.proxy = false;
+
+        _updateStatus('downloading');
+
+        const preferredDevice = options.device || CFG.device || (navigator.gpu ? 'webgpu' : 'wasm');
+        const preferredDtype = options.dtype || CFG.dtype || (preferredDevice === 'webgpu' ? 'fp32' : 'q8');
+
+        try {
+          if (preferredDevice === 'webgpu') {
+            depthPipeline = await pipeline(
+              'depth-estimation',
+              'Xenova/depth-anything-small-hf',
+              { dtype: 'fp32', device: 'webgpu' }
+            );
+            activeDevice = 'webgpu';
+          } else {
+            throw new Error('Fallback to WASM requested');
+          }
+        } catch (gpuErr) {
+          if (window.VisionGuideConfig?.debug) {
+            console.info('[VisionGuide Depth] WebGPU unavailable or failed, falling back to WASM q8:', gpuErr.message);
+          }
           depthPipeline = await pipeline(
             'depth-estimation',
-            'onnx-community/depth-anything-v2-small-hf',
-            { dtype: 'fp32', device: 'webgpu' }
+            'Xenova/depth-anything-small-hf',
+            { dtype: preferredDtype || 'q8', device: 'wasm' }
           );
-          activeDevice = 'webgpu';
-        } else {
-          throw new Error('Fallback to WASM requested');
+          activeDevice = 'wasm';
         }
-      } catch (gpuErr) {
-        if (window.VisionGuideConfig?.debug) {
-          console.info('[VisionGuide Depth] WebGPU unavailable or failed, falling back to WASM q8:', gpuErr.message);
-        }
-        depthPipeline = await pipeline(
-          'depth-estimation',
-          'onnx-community/depth-anything-v2-small-hf',
-          { dtype: preferredDtype || 'q8', device: 'wasm' }
-        );
-        activeDevice = 'wasm';
+
+        depthLoaded = true;
+        depthLoading = false;
+        _updateStatus('ready');
+        if (window.VisionGuideConfig?.debug) console.info(`[VisionGuide Depth] Depth-Anything-V2 ready on ${activeDevice}`);
+        return depthPipeline;
+
+      } catch (err) {
+        depthError = err.message || 'Model failed to load';
+        depthLoading = false;
+        activeDevice = 'none';
+        _updateStatus('error');
+        if (window.VisionGuideConfig?.debug) console.warn('[VisionGuide Depth] Model load failed — using heuristic:', err.message);
+        return null;
+      } finally {
+        depthLoadPromise = null;
       }
-
-      depthLoaded  = true;
-      depthLoading = false;
-      _updateStatus('ready');
-      if (window.VisionGuideConfig?.debug) console.info(`[VisionGuide Depth] Depth-Anything-V2 ready on ${activeDevice}`);
-      return depthPipeline;
-
-    } catch (err) {
-      depthError   = err.message || 'Model failed to load';
-      depthLoading = false;
-      activeDevice = 'none';
-      _updateStatus('error');
-      if (window.VisionGuideConfig?.debug) console.warn('[VisionGuide Depth] Model load failed — using heuristic:', err.message);
-      return null;
-    } finally {
-      depthLoadPromise = null;
-    }})();
+    })();
     return depthLoadPromise;
   }
 
@@ -192,8 +194,8 @@
       return;
     }
 
-    loopVideo    = videoEl;
-    loopActive   = true;
+    loopVideo = videoEl;
+    loopActive = true;
     loopGeneration++;
     if (!frameCanvas) {
       frameCanvas = document.createElement('canvas');
@@ -209,9 +211,9 @@
   function stopDepthLoop() {
     loopActive = false;
     clearTimeout(loopTimer);
-    loopTimer  = null;
-    loopVideo  = null;
-    depthData  = null;
+    loopTimer = null;
+    loopVideo = null;
+    depthData = null;
     depthTimestamp = 0;
     trackDepth.clear();
     loopGeneration++;
@@ -229,7 +231,7 @@
     const frameVideo = loopVideo;
 
     if (!depthLoaded || !loopVideo ||
-        loopVideo.readyState < 2 || loopVideo.videoWidth === 0) {
+      loopVideo.readyState < 2 || loopVideo.videoWidth === 0) {
       _scheduleDepth();
       return;
     }
@@ -254,14 +256,14 @@
       frameCtx.drawImage(frameVideo, 0, 0, inputW, inputH);
 
       // 2. Run Depth-Anything-V2
-      const result = await depthPipeline(frameCanvas);
+      const result = await depthPipeline(frameCanvas.toDataURL('image/jpeg', 0.85));
       if (!loopActive || generation !== loopGeneration) return;
       if (frameVideo !== loopVideo) { _scheduleDepth(); return; }
 
       if (result && result.predicted_depth) {
         const tensor = result.predicted_depth;
-        const raw    = tensor.data;
-        const dims   = tensor.dims || [];
+        const raw = tensor.data;
+        const dims = tensor.dims || [];
         if (!raw?.length) { tensor.dispose?.(); throw new Error('Depth model returned an empty tensor'); }
 
         // Handle [H,W], [1,H,W], or [1,1,H,W].
@@ -328,7 +330,7 @@
         if (trackId !== undefined && trackId !== null) {
           const previous = trackDepth.get(trackId);
           const alpha = CFG.trackSmoothing ?? 0.55;
-          smoothed = previous === undefined ? normalizedDepth : previous * (1-alpha) + normalizedDepth * alpha;
+          smoothed = previous === undefined ? normalizedDepth : previous * (1 - alpha) + normalizedDepth * alpha;
           trackDepth.set(trackId, smoothed);
         }
         return _withMeta(_normalizedDepthToZone(smoothed), 'relative-depth', smoothed, false);
@@ -417,15 +419,15 @@
     if (!badge) return;
 
     const MAP = {
-      loading:     { text: '⏳ Loading depth model…',         cls: 'depth-badge-loading'     },
+      loading: { text: '⏳ Loading depth model…', cls: 'depth-badge-loading' },
       downloading: { text: '⬇ Downloading Depth-Anything-V2…', cls: 'depth-badge-downloading' },
-      ready:       { text: 'Depth model ready',                cls: 'depth-badge-ready'       },
-      error:       { text: 'Using size-based range',           cls: 'depth-badge-heuristic'   },
+      ready: { text: 'Depth model ready', cls: 'depth-badge-ready' },
+      error: { text: 'Using size-based range', cls: 'depth-badge-heuristic' },
     };
 
     const info = MAP[status] || { text: status, cls: '' };
     badge.textContent = info.text;
-    badge.className   = `depth-status-badge ${info.cls}`;
+    badge.className = `depth-status-badge ${info.cls}`;
   }
 
 })();

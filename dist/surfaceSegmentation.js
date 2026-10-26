@@ -112,27 +112,27 @@
   };
 
   /* ─── State ─────────────────────────────────────────────────── */
-  let modelPipeline   = null;
-  let modelLoading    = false;
-  let modelLoaded     = false;
-  let modelError      = null;
-  let loadPromise     = null;
-  let activeDevice    = 'none';
+  let modelPipeline = null;
+  let modelLoading = false;
+  let modelLoaded = false;
+  let modelError = null;
+  let loadPromise = null;
+  let activeDevice = 'none';
 
-  let surfaceMap      = null;   // latest processed surface summary
+  let surfaceMap = null;   // latest processed surface summary
   let surfaceTimestamp = 0;
-  let lastLatencyMs   = 0;
+  let lastLatencyMs = 0;
 
   // Background loop state
-  let loopActive      = false;
-  let loopTimer       = null;
-  let loopVideo       = null;
-  let loopGeneration  = 0;
+  let loopActive = false;
+  let loopTimer = null;
+  let loopVideo = null;
+  let loopGeneration = 0;
   const LOOP_INTERVAL = CFG.intervalMs || 3500;
 
   // Reusable scratch canvas
-  let scratchCanvas   = null;
-  let scratchCtx      = null;
+  let scratchCanvas = null;
+  let scratchCtx = null;
 
   /* ─── Public API ─────────────────────────────────────────────── */
   window.surfaceSegmentationAPI = {
@@ -141,11 +141,11 @@
     stopSurfaceLoop,
     getSurfaceMap: () => surfaceMap && surfaceTimestamp && (Date.now() - surfaceTimestamp <= (CFG.staleAfterMs || 7000)) ? surfaceMap : null,
     getSurfaceAge: () => surfaceTimestamp ? Date.now() - surfaceTimestamp : Infinity,
-    isLoaded:      () => modelLoaded,
-    isLoading:     () => modelLoading,
-    getError:      () => modelError,
-    getDevice:     () => activeDevice,
-    isActive:      () => loopActive,
+    isLoaded: () => modelLoaded,
+    isLoading: () => modelLoading,
+    getError: () => modelError,
+    getDevice: () => activeDevice,
+    isActive: () => loopActive,
     mapLabelToCategory,
     parseSegmentationOutput,
     measureLatency,
@@ -198,12 +198,12 @@
     loadPromise = (async () => {
       try {
         const transformers = await import(
-          'https://cdn.jsdelivr.net/npm/@huggingface/transformers@3.0.2/dist/transformers.esm.min.js'
+          'https://cdn.jsdelivr.net/npm/@huggingface/transformers@3.0.2'
         );
         const { pipeline, env } = transformers;
 
         env.allowLocalModels = false;
-        env.useBrowserCache  = true;
+        env.useBrowserCache = true;
         env.backends.onnx.wasm.proxy = false;
 
         const modelId = options.modelId || CFG.modelId || 'Xenova/segformer-b0-finetuned-ade-512-512';
@@ -368,12 +368,12 @@
       const total = cell.pixels || 1;
       const shares = {
         footpath: cell.counts.footpath / total,
-        road:     cell.counts.road / total,
-        stairs:   cell.counts.stairs / total,
-        wall:     cell.counts.wall / total,
-        floor:    cell.counts.floor / total,
-        terrain:  cell.counts.terrain / total,
-        unknown:  cell.counts.unknown / total
+        road: cell.counts.road / total,
+        stairs: cell.counts.stairs / total,
+        wall: cell.counts.wall / total,
+        floor: cell.counts.floor / total,
+        terrain: cell.counts.terrain / total,
+        unknown: cell.counts.unknown / total
       };
 
       // Determine top category
@@ -418,22 +418,22 @@
       return {
         primaryCategory: topShare / count >= 0.30 ? top : 'unknown',
         footpathPct: pct('footpath'),
-        roadPct:     pct('road'),
-        stairsPct:   pct('stairs'),
-        wallPct:     pct('wall'),
-        floorPct:    pct('floor'),
-        terrainPct:  pct('terrain')
+        roadPct: pct('road'),
+        stairsPct: pct('stairs'),
+        wallPct: pct('wall'),
+        floorPct: pct('floor'),
+        terrainPct: pct('terrain')
       };
     };
 
     const totalCalculated = Math.max(1, totalMaskPixels);
     const overallShares = {
       footpath: Math.round((categoryPixels.footpath / totalCalculated) * 100),
-      road:     Math.round((categoryPixels.road / totalCalculated) * 100),
-      stairs:   Math.round((categoryPixels.stairs / totalCalculated) * 100),
-      wall:     Math.round((categoryPixels.wall / totalCalculated) * 100),
-      floor:    Math.round((categoryPixels.floor / totalCalculated) * 100),
-      terrain:  Math.round((categoryPixels.terrain / totalCalculated) * 100)
+      road: Math.round((categoryPixels.road / totalCalculated) * 100),
+      stairs: Math.round((categoryPixels.stairs / totalCalculated) * 100),
+      wall: Math.round((categoryPixels.wall / totalCalculated) * 100),
+      floor: Math.round((categoryPixels.floor / totalCalculated) * 100),
+      terrain: Math.round((categoryPixels.terrain / totalCalculated) * 100)
     };
 
     return {
@@ -444,9 +444,9 @@
       overallShares,
       cells: cellSummary,
       zones: {
-        left:   computeZone([0, 1]),
+        left: computeZone([0, 1]),
         center: computeZone([2, 2]),
-        right:  computeZone([3, 4])
+        right: computeZone([3, 4])
       }
     };
   }

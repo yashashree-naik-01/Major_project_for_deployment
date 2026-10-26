@@ -4,12 +4,19 @@
   const N = window.VisionGuideNavigation;
   const ui = {
     engine: null, map: new N.MapController(), helpers: {}, places: [], query: '', originQuery: '', originResults: [], originError: '', originLoading: false, mounted: false,
+    _autoLocationAttempted: false,
+    _locationFailedSpoken: false,
 
     configure(helpers = {}) {
       this.helpers = helpers;
       if (!this.engine) {
         this.engine = new N.NavigationEngine({ announce: (text, options) => helpers.speak(text, options) });
-        this.engine.subscribe(state => this.update(state));
+        this.engine.subscribe(state => {
+          this.update(state);
+          if (document.querySelector('.page-navigate') && !state.active && !state.location && ['denied', 'unavailable', 'lost'].includes(state.locationStatus)) {
+            this._announceLocationFailed();
+          }
+        });
       }
       if (!this.mounted) {
         document.addEventListener('submit', event => {
@@ -95,8 +102,22 @@
       const container = document.getElementById('navigation-map');
       if (container) this.map.mount(container, this.engine.getState());
       this.update(this.engine.getState());
+      this.autoSelectPreciseLocation();
     },
-    unmountMap() { this.map.destroy(); this.engine?.releaseLocationIfIdle?.(); },
+    unmountMap() {
+      this.map.destroy();
+      this.engine?.releaseLocationIfIdle?.();
+      this._autoLocationAttempted = false;
+      this._locationFailedSpoken = false;
+    },
+
+    autoSelectPreciseLocation() {
+      const state = this.engine?.getState() || {};
+      const hasFreshGps = state.location?.source === 'gps' && state.locationStatus === 'ready';
+      if (hasFreshGps || state.locationStatus === 'requesting' || this._autoLocationAttempted) return;
+      this._autoLocationAttempted = true;
+      void this.enableLocation({ refresh: false, isAuto: true });
+    },
 
     update(state) {
       const root = document.querySelector('.page-navigate');
@@ -179,12 +200,21 @@
 
     async search(query, options = {}) {
       this.query = String(query || '').trim();
+      const input = document.getElementById('destination-search');
+      if (input && input.value !== this.query) input.value = this.query;
       try {
         const results = await this.engine.searchDestinations(this.query);
         if (options.fromVoice) {
-          if (results.length === 1) await this.selectResult(0);
-          else if (results.length) await this.helpers.speak(`I found ${results.length} matches for ${this.query}. Say select result 1, or choose a result on screen.`, { priority: 45 });
-          else await this.helpers.speak(`I could not find ${this.query}. Try a more specific place or address.`, { priority: 45 });
+          if (results.length > 0) {
+            const nearestIndex = this.findNearestResultIndex(results);
+            await this.selectResult(nearestIndex);
+            const chosen = results[nearestIndex];
+            if (chosen) {
+              await this.helpers.speak?.(`Walking route to ${chosen.name} is ready.`, { priority: 45 });
+            }
+          } else {
+            await this.helpers.speak?.(`I could not find ${this.query}. Try a more specific place or address.`, { priority: 45 });
+          }
         }
         return results;
       } catch (error) {
@@ -193,14 +223,66 @@
       }
     },
 
-    async enableLocation() {
-      try { await this.engine.enableLocation({ refresh: Boolean(this.engine.getState().location) }); }
-      catch (error) { if (error.name !== 'AbortError') this.helpers.toast?.(error.message); }
+    async enableLocation(options = {}) {
+      this._locationFailedSpoken = false;
+      try {
+        const state = this.engine.getState();
+        const shouldRefresh = options.refresh !== undefined ? options.refresh : Boolean(state.location?.source === 'gps');
+        const point = await this.engine.enableLocation({ refresh: shouldRefresh, ...options });
+        if (!point || point.usable === false) {
+          this._announceLocationFailed();
+          return null;
+        }
+        return point;
+      } catch (error) {
+        if (error.name !== 'AbortError') {
+          this.helpers.toast?.(error.message);
+          this._announceLocationFailed();
+        }
+        return null;
+      }
     },
+
+    _announceLocationFailed() {
+      if (this._locationFailedSpoken) return;
+      this._locationFailedSpoken = true;
+      const message = 'Precise location unable to detect, please enter your location.';
+      this.helpers.speak?.(message, { priority: 70, interrupt: true });
+      const originInput = document.getElementById('origin-search');
+      if (originInput) {
+        try { originInput.focus({ preventScroll: true }); } catch (_) {}
+      }
+    },
+
+    findNearestResultIndex(results) {
+      if (!results || !results.length) return -1;
+      if (results.length === 1) return 0;
+      const state = this.engine?.getState() || {};
+      const location = state.location;
+      if (!location || !Number.isFinite(location.latitude) || !Number.isFinite(location.longitude)) {
+        return 0;
+      }
+      let nearestIndex = 0;
+      let minDistance = Infinity;
+      for (let i = 0; i < results.length; i++) {
+        const item = results[i];
+        if (!Number.isFinite(item.latitude) || !Number.isFinite(item.longitude)) continue;
+        const dist = window.VisionGuideNavigation?.LocationService?.distance
+          ? window.VisionGuideNavigation.LocationService.distance(location, item)
+          : Math.hypot(item.latitude - location.latitude, item.longitude - location.longitude);
+        if (dist < minDistance) {
+          minDistance = dist;
+          nearestIndex = i;
+        }
+      }
+      return nearestIndex;
+    },
+
     microphone() {
       if (!window.voiceCommandAPI) { this.helpers.toast?.('Voice recognition is unavailable in this browser.'); return; }
+      window.voiceCommandAPI.expectDestination?.();
       window.voiceCommandAPI.start();
-      this.helpers.speak?.('Say navigate to, followed by your destination.', { priority: 35, interrupt: false });
+      this.helpers.speak?.('Say your destination.', { priority: 35, interrupt: false });
     },
     async selectResult(index) {
       const result = this.engine.getState().searchResults[index];
@@ -211,16 +293,20 @@
     async selectPlace(id) {
       const place = this.places.find(item => Number(item.id) === Number(id));
       if (!place) return false;
+      const input = document.getElementById('destination-search');
+      if (input) input.value = place.name;
       if (Number.isFinite(place.latitude) && Number.isFinite(place.longitude)) {
-        try { await this.engine.chooseDestination(place); return true; } catch (error) { this.helpers.toast?.(error.message); return false; }
+        try {
+          await this.engine.chooseDestination(place);
+          this.helpers.toast?.(`Walking route to ${place.name} is ready.`);
+          return true;
+        } catch (error) {
+          this.helpers.toast?.(error.message);
+          return false;
+        }
       }
-      const results = await this.search(place.address || place.name);
-      if (!results.length) return false;
-      if (results.length > 1) {
-        this.helpers.speak?.(`I found ${results.length} matches for ${place.name}. Select the correct result on screen or say select result 1.`, { priority: 45 });
-        return true;
-      }
-      try { await this.engine.chooseDestination(results[0]); return true; } catch (error) { this.helpers.toast?.(error.message); return false; }
+      const results = await this.search(place.address || place.name, { fromVoice: true });
+      return results.length > 0;
     },
     async selectVoiceResult(number) {
       const ok = await this.selectResult(Math.max(0, Number(number) - 1));
@@ -228,12 +314,19 @@
       return ok;
     },
     async navigateToName(name) {
-      const query = String(name || '').trim().toLowerCase();
-      const saved = this.places.find(place => place.name.toLowerCase() === query) || this.places.find(place => `${place.name} ${place.address}`.toLowerCase().includes(query));
-      if (saved) return this.selectPlace(saved.id);
-      this.query = name;
+      const query = String(name || '').trim();
+      if (!query) return false;
+      this.query = query;
       if (!document.querySelector('.page-navigate')) this.helpers.go?.('navigate');
-      const results = await this.search(name, { fromVoice: true });
+      const input = document.getElementById('destination-search');
+      if (input) input.value = query;
+      const queryLower = query.toLowerCase();
+      const saved = this.places.find(place => place.name.toLowerCase() === queryLower) ||
+        this.places.find(place => `${place.name} ${place.address}`.toLowerCase().includes(queryLower));
+      if (saved && Number.isFinite(saved.latitude) && Number.isFinite(saved.longitude)) {
+        return this.selectPlace(saved.id);
+      }
+      const results = await this.search(query, { fromVoice: true });
       return results.length > 0;
     },
     async start() { try { await this.engine.start(); } catch (error) { this.helpers.toast?.(error.message); this.helpers.speak?.(error.message, { priority: 50 }); } },

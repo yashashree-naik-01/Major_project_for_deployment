@@ -30,7 +30,7 @@
 
   /* ─── Thresholds ─────────────────────────────────────────────── */
   // Detected bbox must cover ≥ this fraction of a cell to mark it obstacle
-  const DET_OVERLAP  = CFG.detectionOverlap ?? 0.20;
+  const DET_OVERLAP = CFG.detectionOverlap ?? 0.20;
   let _smoothedCells = [];
   let _lastFloorBaseline = null;
   let _lastRange = 1;
@@ -43,10 +43,10 @@
   };
 
   /* ─── Announcement throttle ──────────────────────────────────── */
-  let _prevSig       = '';
-  let _prevSigTime   = 0;
-  const REPEAT_CD    = 5000;  // re-announce identical advice after 5 s
-  const CHANGE_CD    = 1500;  // announce changed advice after 1.5 s
+  let _prevSig = '';
+  let _prevSigTime = 0;
+  const REPEAT_CD = 5000;  // re-announce identical advice after 5 s
+  const CHANGE_CD = 1500;  // announce changed advice after 1.5 s
 
   /* ─── Public API ─────────────────────────────────────────────── */
   window.freeSpaceAPI = {
@@ -219,7 +219,7 @@
     tracks.forEach(track => {
       const [bx, by, bw, bh] = track.bbox;
       const zone = track.distInfo?.zone || 'medium';
-      const w  = _zoneWeight(zone);
+      const w = _zoneWeight(zone);
 
       grid.forEach(cell => {
         // Don't downgrade existing high-priority obstacle
@@ -232,10 +232,10 @@
         const inter = Math.max(0, ix2 - ix1) * Math.max(0, iy2 - iy1);
 
         if (inter / (cell.w * cell.h) >= DET_OVERLAP) {
-          cell.status  = 'obstacle';
-          cell.zone    = zone;
-          cell.src     = 'det';
-          cell.label   = track.label;
+          cell.status = 'obstacle';
+          cell.zone = zone;
+          cell.src = 'det';
+          cell.label = track.label;
           cell.trackId = track.id;
         }
       });
@@ -326,8 +326,17 @@
     // Focus on near and mid walking rows (rows 1 and 2 in 3-row grid)
     grid.forEach((cell, index) => {
       if (cell.r < 1) return;
+
+      // Do not classify detected objects as ground drop-offs.
+      if (cell.status === 'obstacle' && cell.src === 'det') return;
+
       const baseline = floorBaseline[cell.r];
-      // In a drop-off, depth is significantly farther (smaller inverse depth) than baseline
+
+      // Ignore invalid depth or baseline values.
+      if (!Number.isFinite(baseline) ||
+        !Number.isFinite(cellDepth[index])) return;
+
+      // In a drop-off, depth is significantly farther than baseline.
       const dropDelta = (baseline - cellDepth[index]) / range;
 
       if (dropDelta >= dropThreshold) {
@@ -382,8 +391,8 @@
 
     // ── Hazard Classification: Descending Stairs, Drop-off, Ascending Stairs ──
     const centerNear = _median([cellDepth[11], cellDepth[12], cellDepth[13]]);
-    const centerMid  = _median([cellDepth[6], cellDepth[7], cellDepth[8]]);
-    const centerFar  = _median([cellDepth[1], cellDepth[2], cellDepth[3]]);
+    const centerMid = _median([cellDepth[6], cellDepth[7], cellDepth[8]]);
+    const centerFar = _median([cellDepth[1], cellDepth[2], cellDepth[3]]);
     const expectedCenterMid = (centerNear + centerFar) / 2;
     const midElevation = (centerMid - expectedCenterMid) / range;
 
@@ -558,7 +567,7 @@
       // Sidewalk or footpath alone NEVER overrides an obstacle or drop-off!
       // If cell.status is 'obstacle' or 'dropoff', we keep it strictly intact.
       if (shares.footpath >= 0.35 || match.primaryCategory === 'footpath' ||
-          shares.floor >= 0.35 || match.primaryCategory === 'floor') {
+        shares.floor >= 0.35 || match.primaryCategory === 'floor') {
         cell.surfaceGroundConfirmed = true;
       } else {
         cell.surfaceGroundConfirmed = false;
@@ -635,8 +644,8 @@
     ];
 
     const yStart = Math.floor(dh * 0.35);
-    const yEnd   = Math.floor(dh * 0.95);
-    const stepY  = Math.max(1, Math.floor(dh / 60));
+    const yEnd = Math.floor(dh * 0.95);
+    const stepY = Math.max(1, Math.floor(dh / 60));
     const tiltWindow = Math.max(2, Math.floor(dh / 30));
 
     const detectedEdges = [];
@@ -651,13 +660,13 @@
       const c2 = data[(y + stepY) * dw + xc];
       const c3 = data[Math.min(dh - 1, y + stepY * 2) * dw + xc];
       const centerEdge = (Number.isFinite(c1) && Number.isFinite(c2) && Math.abs(c1 - c2) >= threshold) ||
-                         (Number.isFinite(c1) && Number.isFinite(c3) && Math.abs(c1 - c3) >= threshold);
+        (Number.isFinite(c1) && Number.isFinite(c3) && Math.abs(c1 - c3) >= threshold);
 
       if (!centerEdge) {
         const l1 = data[y * dw + xPositions[0]], l2 = data[(y + stepY) * dw + xPositions[0]];
         const r1 = data[y * dw + xPositions[2]], r2 = data[(y + stepY) * dw + xPositions[2]];
         const sideDirect = Number.isFinite(l1) && Number.isFinite(l2) && Math.abs(l1 - l2) >= threshold &&
-                           Number.isFinite(r1) && Number.isFinite(r2) && Math.abs(r1 - r2) >= threshold;
+          Number.isFinite(r1) && Number.isFinite(r2) && Math.abs(r1 - r2) >= threshold;
         if (!sideDirect) continue;
       }
 
@@ -735,8 +744,8 @@
     ];
 
     const yStart = Math.floor(dh * 0.20);
-    const yEnd   = Math.floor(dh * 0.85);
-    const stepY  = Math.max(1, Math.floor(dh / 60));
+    const yEnd = Math.floor(dh * 0.85);
+    const stepY = Math.max(1, Math.floor(dh / 60));
     const tiltWindow = Math.max(2, Math.floor(dh / 30));
 
     const detectedRisers = [];
@@ -751,13 +760,13 @@
       const c2 = data[(y + stepY) * dw + xc];
       const c3 = data[Math.min(dh - 1, y + stepY * 2) * dw + xc];
       const centerEdge = (Number.isFinite(c1) && Number.isFinite(c2) && Math.abs(c1 - c2) >= threshold) ||
-                         (Number.isFinite(c1) && Number.isFinite(c3) && Math.abs(c1 - c3) >= threshold);
+        (Number.isFinite(c1) && Number.isFinite(c3) && Math.abs(c1 - c3) >= threshold);
 
       if (!centerEdge) {
         const l1 = data[y * dw + xPositions[0]], l2 = data[(y + stepY) * dw + xPositions[0]];
         const r1 = data[y * dw + xPositions[2]], r2 = data[(y + stepY) * dw + xPositions[2]];
         const sideDirect = Number.isFinite(l1) && Number.isFinite(l2) && Math.abs(l1 - l2) >= threshold &&
-                           Number.isFinite(r1) && Number.isFinite(r2) && Math.abs(r1 - r2) >= threshold;
+          Number.isFinite(r1) && Number.isFinite(r2) && Math.abs(r1 - r2) >= threshold;
         if (!sideDirect) continue;
       }
 
@@ -813,19 +822,19 @@
   function _cellMedian(data, dw, dh, cell) {
     const x1 = Math.floor(cell.c / COLS * dw), x2 = Math.max(x1 + 1, Math.floor((cell.c + 1) / COLS * dw));
     const y1 = Math.floor(cell.r / ROWS * dh), y2 = Math.max(y1 + 1, Math.floor((cell.r + 1) / ROWS * dh));
-    const stepX = Math.max(1, Math.floor((x2-x1)/12));
-    const stepY = Math.max(1, Math.floor((y2-y1)/8));
+    const stepX = Math.max(1, Math.floor((x2 - x1) / 12));
+    const stepY = Math.max(1, Math.floor((y2 - y1) / 8));
     const values = [];
-    for (let y=y1; y<y2; y+=stepY) for (let x=x1; x<x2; x+=stepX) {
-      const value=data[y*dw+x]; if (Number.isFinite(value)) values.push(value);
+    for (let y = y1; y < y2; y += stepY) for (let x = x1; x < x2; x += stepX) {
+      const value = data[y * dw + x]; if (Number.isFinite(value)) values.push(value);
     }
     return _median(values);
   }
 
   function _median(values) {
     if (!values.length) return 0;
-    values.sort((a,b)=>a-b);
-    return values[Math.floor(values.length/2)];
+    values.sort((a, b) => a - b);
+    return values[Math.floor(values.length / 2)];
   }
 
   function _smoothGrid(grid) {
@@ -837,10 +846,10 @@
       // Raise new hazards immediately; smooth only the decay to reduce flicker.
       const severity = !previous || current > previous.severity
         ? current
-        : previous.severity * (1-alpha) + current * alpha;
+        : previous.severity * (1 - alpha) + current * alpha;
       const status = isDrop ? 'dropoff'
         : severity >= (CFG.obstacleThreshold ?? 0.62) ? 'obstacle'
-        : severity >= (CFG.cautionThreshold ?? 0.26) ? 'caution' : 'clear';
+          : severity >= (CFG.cautionThreshold ?? 0.26) ? 'caution' : 'clear';
       const next = {
         severity,
         status,
@@ -861,16 +870,16 @@
     // Bottom row — visually nearest image region (not a metric distance)
     const near = grid.filter(c => c.r === ROWS - 1);
     // Middle row — intermediate image region
-    const mid  = grid.filter(c => c.r === ROWS - 2);
+    const mid = grid.filter(c => c.r === ROWS - 2);
 
-    const nL  = near.filter(c => c.c < 2);
-    const nC  = near.filter(c => c.c === 2);
-    const nR  = near.filter(c => c.c > 2);
-    const mC  = mid.filter(c => c.c >= 1 && c.c <= 3);
+    const nL = near.filter(c => c.c < 2);
+    const nC = near.filter(c => c.c === 2);
+    const nR = near.filter(c => c.c > 2);
+    const mC = mid.filter(c => c.c >= 1 && c.c <= 3);
 
-    const lClear  = nL.every(c => !isObs(c));
-    const cClear  = nC.every(c => !isObs(c)) && mC.every(c => !isObs(c));
-    const rClear  = nR.every(c => !isObs(c));
+    const lClear = nL.every(c => !isObs(c));
+    const cClear = nC.every(c => !isObs(c)) && mC.every(c => !isObs(c));
+    const rClear = nR.every(c => !isObs(c));
     const mcClear = mC.every(c => !isObs(c));
 
     // ── FEATURE 4: Hazard Advice Integration ──────────────────────
@@ -980,7 +989,7 @@
     }
 
     // Closest detected obstacle in center path
-    const cObs  = nC.find(isObs) || mC.find(isObs);
+    const cObs = nC.find(isObs) || mC.find(isObs);
     const cZone = cObs?.zone || 'medium';
 
     let speech = '', summary = '', direction = 'forward';
@@ -990,46 +999,46 @@
       const nearCells = grid.filter(c => c.r === ROWS - 1 && c.c >= 1 && c.c <= 3);
       const isUnverified = nearCells.every(c => c.surfaceCategory === 'unknown' && (!c.surfaceConfidence || c.surfaceConfidence < 0.25));
       if (isUnverified && (!window.depthAPI || !window.depthAPI.isLoaded?.())) {
-        speech    = 'Surface visibility is limited. Proceed with caution.';
-        summary   = 'Caution — limited visibility';
+        speech = 'Surface visibility is limited. Proceed with caution.';
+        summary = 'Caution — limited visibility';
         direction = 'slow';
       } else {
-        speech    = 'No tracked obstacle is ahead. Continue carefully.';
-        summary   = 'No alert ahead';
+        speech = 'No tracked obstacle is ahead. Continue carefully.';
+        summary = 'No alert ahead';
         direction = 'forward';
       }
 
     } else if (cClear && mcClear) {
-      summary   = 'No center alert';
+      summary = 'No center alert';
       direction = 'forward';
-      speech    = 'No tracked obstacle is in the center.';
+      speech = 'No tracked obstacle is in the center.';
       if (!lClear) speech += ' Obstacles to your left.';
       if (!rClear) speech += ' Obstacles to your right.';
 
     } else if (!cClear && lClear && !rClear) {
-      summary   = 'Turn left';
+      summary = 'Turn left';
       direction = 'left';
-      speech    = `Obstacle directly ahead${cZone === 'danger' ? ', in the nearest range' : ''}. The left side appears clearer.`;
+      speech = `Obstacle directly ahead${cZone === 'danger' ? ', in the nearest range' : ''}. The left side appears clearer.`;
 
     } else if (!cClear && !lClear && rClear) {
-      summary   = 'Turn right';
+      summary = 'Turn right';
       direction = 'right';
-      speech    = `Obstacle directly ahead${cZone === 'danger' ? ', in the nearest range' : ''}. The right side appears clearer.`;
+      speech = `Obstacle directly ahead${cZone === 'danger' ? ', in the nearest range' : ''}. The right side appears clearer.`;
 
     } else if (!cClear && lClear && rClear) {
-      summary   = 'Obstacle ahead';
+      summary = 'Obstacle ahead';
       direction = 'split';
-      speech    = 'Obstacle directly ahead. Both sides currently have fewer alerts.';
+      speech = 'Obstacle directly ahead. Both sides currently have fewer alerts.';
 
     } else if (!cClear && !lClear && !rClear) {
-      summary   = 'Blocked';
+      summary = 'Blocked';
       direction = 'stop';
-      speech    = 'Path blocked on all sides. Please stop.';
+      speech = 'Path blocked on all sides. Please stop.';
 
     } else {
-      summary   = 'Caution';
+      summary = 'Caution';
       direction = 'slow';
-      speech    = 'Caution ahead. Proceed slowly.';
+      speech = 'Caution ahead. Proceed slowly.';
     }
 
     return { speech, summary, direction, lClear, cClear, rClear };
@@ -1061,7 +1070,7 @@
 
     // ── 2. Subtle grid lines (only near + mid rows) ────────────────
     ctx.strokeStyle = 'rgba(255,255,255,0.06)';
-    ctx.lineWidth   = 0.5;
+    ctx.lineWidth = 0.5;
     for (let r = 1; r < ROWS; r++) {
       ctx.beginPath();
       ctx.moveTo(0, r * cellH); ctx.lineTo(dw, r * cellH);
@@ -1094,8 +1103,8 @@
       if (cell.src === 'surface-wall') return 'rgba(239,68,68,0.46)'; // Red for wall/barrier
       switch (cell.zone) {
         case 'danger': return 'rgba(248,113,113,0.42)';
-        case 'close':  return 'rgba(251,146,60,0.36)';
-        default:       return 'rgba(250,204,21,0.28)';
+        case 'close': return 'rgba(251,146,60,0.36)';
+        default: return 'rgba(250,204,21,0.28)';
       }
     }
     if (cell.status === 'caution') {
@@ -1111,24 +1120,24 @@
 
   function _drawRibbon(ctx, advice, w, h) {
     const rH = 30;
-    const y  = h - rH;
+    const y = h - rH;
     const t3 = w / 3;
 
     const centerLabel = !advice.cClear
       ? (advice.hazard?.type === 'uncovered-drain' ? '⚠️ Drain'
-         : advice.hazard?.type === 'pothole' ? '🕳️ Pothole'
-         : advice.hazard?.type === 'curb' ? '📐 Curb'
-         : advice.hazard?.type === 'raised-surface' ? '⚡ Raised'
-         : advice.hazard?.type === 'broken-pavement' ? '〰️ Uneven'
-         : advice.hazard?.type === 'dropoff' ? '⚠️ Drop-off'
-         : advice.hazard?.type?.startsWith('stairs') ? '🪜 Stairs'
-         : '⛔ Obstacle')
+        : advice.hazard?.type === 'pothole' ? '🕳️ Pothole'
+          : advice.hazard?.type === 'curb' ? '📐 Curb'
+            : advice.hazard?.type === 'raised-surface' ? '⚡ Raised'
+              : advice.hazard?.type === 'broken-pavement' ? '〰️ Uneven'
+                : advice.hazard?.type === 'dropoff' ? '⚠️ Drop-off'
+                  : advice.hazard?.type?.startsWith('stairs') ? '🪜 Stairs'
+                    : '⛔ Obstacle')
       : '▲ No alert';
 
     const panels = [
-      { x: 0,      label: advice.lClear ? '← No alert' : '← Block', clear: advice.lClear },
-      { x: t3,     label: centerLabel,  clear: advice.cClear },
-      { x: t3 * 2, label: advice.rClear ? 'No alert →' : 'Block →',  clear: advice.rClear },
+      { x: 0, label: advice.lClear ? '← No alert' : '← Block', clear: advice.lClear },
+      { x: t3, label: centerLabel, clear: advice.cClear },
+      { x: t3 * 2, label: advice.rClear ? 'No alert →' : 'Block →', clear: advice.rClear },
     ];
 
     panels.forEach(p => {
@@ -1137,14 +1146,14 @@
         : 'rgba(248,113,113,0.82)';
       ctx.fillRect(p.x, y, t3, rH);
 
-      ctx.fillStyle   = 'rgba(0,0,0,0.85)';
-      ctx.font        = 'bold 11px Inter, system-ui, sans-serif';
-      ctx.textAlign   = 'center';
+      ctx.fillStyle = 'rgba(0,0,0,0.85)';
+      ctx.font = 'bold 11px Inter, system-ui, sans-serif';
+      ctx.textAlign = 'center';
       ctx.textBaseline = 'middle';
       ctx.fillText(p.label, p.x + t3 / 2, y + rH / 2);
     });
 
-    ctx.textAlign    = 'left';
+    ctx.textAlign = 'left';
     ctx.textBaseline = 'alphabetic';
   }
 
@@ -1155,12 +1164,12 @@
     const sz = Math.min(w, h) * 0.055;
 
     const DIR = {
-      forward: { color: '#4ade80', angle: 0         },
-      left:    { color: '#60a5fa', angle: -Math.PI/5 },
-      right:   { color: '#60a5fa', angle:  Math.PI/5 },
-      split:   { color: '#facc15', angle: 0          },
-      slow:    { color: '#facc15', angle: 0          },
-      stop:    { color: '#f87171', angle: null        },
+      forward: { color: '#4ade80', angle: 0 },
+      left: { color: '#60a5fa', angle: -Math.PI / 5 },
+      right: { color: '#60a5fa', angle: Math.PI / 5 },
+      split: { color: '#facc15', angle: 0 },
+      slow: { color: '#facc15', angle: 0 },
+      stop: { color: '#f87171', angle: null },
     };
     const d = DIR[advice.direction] || DIR.slow;
 
@@ -1172,33 +1181,33 @@
     if (d.angle === null) {
       // ✗ stop symbol
       ctx.strokeStyle = d.color;
-      ctx.lineWidth   = 4;
+      ctx.lineWidth = 4;
       ctx.globalAlpha = 0.88;
       ctx.lineCap = 'round';
       ctx.beginPath(); ctx.moveTo(-sz, -sz); ctx.lineTo(sz, sz); ctx.stroke();
-      ctx.beginPath(); ctx.moveTo(sz, -sz);  ctx.lineTo(-sz, sz); ctx.stroke();
+      ctx.beginPath(); ctx.moveTo(sz, -sz); ctx.lineTo(-sz, sz); ctx.stroke();
     } else {
       ctx.rotate(d.angle);
       // Arrow chevron
       ctx.globalAlpha = 0.88;
-      ctx.fillStyle   = d.color;
+      ctx.fillStyle = d.color;
       ctx.strokeStyle = 'rgba(0,0,0,0.4)';
-      ctx.lineWidth   = 1.5;
+      ctx.lineWidth = 1.5;
       ctx.beginPath();
-      ctx.moveTo(0,        -sz * 1.9);
-      ctx.lineTo(sz,        sz * 0.3);
+      ctx.moveTo(0, -sz * 1.9);
+      ctx.lineTo(sz, sz * 0.3);
       ctx.lineTo(sz * 0.38, sz * 0.3);
       ctx.lineTo(sz * 0.38, sz * 1.3);
-      ctx.lineTo(-sz * 0.38,sz * 1.3);
-      ctx.lineTo(-sz * 0.38,sz * 0.3);
-      ctx.lineTo(-sz,       sz * 0.3);
+      ctx.lineTo(-sz * 0.38, sz * 1.3);
+      ctx.lineTo(-sz * 0.38, sz * 0.3);
+      ctx.lineTo(-sz, sz * 0.3);
       ctx.closePath();
       ctx.fill();
       ctx.stroke();
     }
 
     ctx.restore();
-    ctx.shadowBlur  = 0;
+    ctx.shadowBlur = 0;
     ctx.globalAlpha = 1;
   }
 
@@ -1209,12 +1218,12 @@
     const now = Date.now();
     const elapsed = now - _prevSigTime;
     if (advice.summary !== _prevSig && elapsed > CHANGE_CD) return true;
-    if (advice.summary === _prevSig && elapsed > REPEAT_CD)  return true;
+    if (advice.summary === _prevSig && elapsed > REPEAT_CD) return true;
     return false;
   }
 
   function markSent(advice) {
-    _prevSig     = advice.summary;
+    _prevSig = advice.summary;
     _prevSigTime = Date.now();
   }
 

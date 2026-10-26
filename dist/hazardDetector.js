@@ -30,19 +30,19 @@
   const FS_CFG = window.VisionGuideConfig?.freeSpace || {};
 
   /* ─── Thresholds ─────────────────────────────────────────────── */
-  const POTHOLE_MIN_DELTA       = CFG.potholeMinDepthDelta ?? 0.16;
+  const POTHOLE_MIN_DELTA = CFG.potholeMinDepthDelta ?? 0.16;
   const POTHOLE_CONFIDENT_DELTA = CFG.potholeConfidentDelta ?? 0.28;
-  const DRAIN_MIN_DELTA         = CFG.drainMinDepthDelta ?? 0.32;
-  const DRAIN_CONFIDENT_DELTA   = CFG.drainConfidentDelta ?? 0.42;
-  const CURB_MIN_STEP           = CFG.curbMinStepDelta ?? 0.08;
-  const CURB_CONFIDENT_STEP     = CFG.curbConfidentDelta ?? 0.14;
-  const RAISED_MIN_DELTA        = CFG.raisedSurfaceMinDelta ?? 0.10;
-  const RAISED_MAX_DELTA        = CFG.raisedSurfaceMaxDelta ?? 0.24;
-  const BROKEN_MIN_VARIANCE     = CFG.brokenPavementMinVariance ?? 0.08;
-  const BROKEN_CONFIDENT_VAR    = CFG.brokenPavementConfidentVariance ?? 0.14;
-  const CONFIRM_FRAMES          = CFG.confirmFrames ?? 2;
-  const HOLD_MS                 = CFG.holdMs ?? 1200;
-  const MIN_RELIABLE_RANGE      = 0.05;
+  const DRAIN_MIN_DELTA = CFG.drainMinDepthDelta ?? 0.50;
+  const DRAIN_CONFIDENT_DELTA = CFG.drainConfidentDelta ?? 0.60;
+  const CURB_MIN_STEP = CFG.curbMinStepDelta ?? 0.08;
+  const CURB_CONFIDENT_STEP = CFG.curbConfidentDelta ?? 0.14;
+  const RAISED_MIN_DELTA = CFG.raisedSurfaceMinDelta ?? 0.10;
+  const RAISED_MAX_DELTA = CFG.raisedSurfaceMaxDelta ?? 0.24;
+  const BROKEN_MIN_VARIANCE = CFG.brokenPavementMinVariance ?? 0.08;
+  const BROKEN_CONFIDENT_VAR = CFG.brokenPavementConfidentVariance ?? 0.14;
+  const CONFIRM_FRAMES = CFG.confirmFrames ?? 2;
+  const HOLD_MS = CFG.holdMs ?? 1200;
+  const MIN_RELIABLE_RANGE = 0.05;
 
   /* ─── Temporal Hazard Tracker ────────────────────────────────── */
   // Map<hazardKey, { category, side, row, consecutiveFrames, firstSeen, lastSeen, confidence, maxDelta }>
@@ -177,11 +177,19 @@
 
     for (const [colStr, items] of Object.entries(colGroups)) {
       const c = Number(colStr);
-      const isLongitudinalTrench = items.length >= 2; // spans near & mid rows
       const maxDelta = Math.max(...items.map(i => i.dropDelta));
       const hasRoadProximity = items.some(i => i.cell.surfaceCategory === 'road' || i.cell.surfaceCategory === 'terrain');
+      const isLongitudinalTrench =
+        items.length >= 2 &&
+        items.some(i => i.cell.r === 1) &&
+        items.some(i => i.cell.r === 2) &&
+        maxDelta >= DRAIN_MIN_DELTA; // spans near & mid rows
 
-      if (isLongitudinalTrench || maxDelta >= DRAIN_CONFIDENT_DELTA) {
+      if (
+        hasRoadProximity &&
+        maxDelta >= DRAIN_CONFIDENT_DELTA &&
+        isLongitudinalTrench
+      ) {
         const side = c < 2 ? 'left' : c > 2 ? 'right' : 'center';
         const isNear = items.some(i => i.cell.r === 2);
         const isConfident = maxDelta >= DRAIN_CONFIDENT_DELTA || isLongitudinalTrench;
@@ -220,90 +228,166 @@
      Characteristics: Bounded ground concavity surrounded by
      continuous ground/road, unlike an open cliff edge.
   ═══════════════════════════════════════════════════════════════ */
+
   function detectPotholes(grid, depthMap, surfaceMap, tracks, floorBaseline, range, vw, vh) {
     const results = [];
-    if (!floorBaseline) return results;
+
+    if (
+      !Array.isArray(grid) ||
+      !depthMap?.data ||
+      !depthMap.width ||
+      !depthMap.height ||
+      !Array.isArray(floorBaseline) ||
+      !Number.isFinite(range) ||
+      range < MIN_RELIABLE_RANGE
+    ) {
+      return results;
+    }
 
     const COLS = 5;
     const ROWS = 3;
 
-    // Scan near and mid walking rows
+    // Require stronger evidence than a single depth difference.
+    const MIN_DELTA = Math.max(POTHOLE_MIN_DELTA, 0.30);
+    const CONFIDENT_DELTA = Math.max(POTHOLE_CONFIDENT_DELTA, 0.40);
+
+    const isWalkable = cell =>
+      cell &&
+      ['road', 'footpath', 'floor', 'terrain'].includes(
+        String(cell.surfaceCategory || '').toLowerCase()
+      );
+
+    const getDepth = cell => {
+      if (!cell) return NaN;
+      const value = _cellAvgDepth(cell, depthMap);
+      return Number.isFinite(value) ? value : NaN;
+    };
+
     for (let r = 1; r < ROWS; r++) {
       for (let c = 0; c < COLS; c++) {
-        const cell = grid[r * COLS + c];
-        if (cell.status === 'obstacle' && cell.src === 'det') continue; // Skip physical objects
+        const index = r * COLS + c;
+        const cell = grid[index];
 
-        const base = floorBaseline[r];
-        const cellD = _cellAvgDepth(cell, depthMap);
-        if (!Number.isFinite(cellD)) continue;
+        if (!cell || !isWalkable(cell)) continue;
 
-        const dropDelta = (base - cellD) / range;
-        if (dropDelta < POTHOLE_MIN_DELTA || dropDelta >= DRAIN_MIN_DELTA) {
-          continue; // Either too shallow or is an uncovered drain
-        }
+        // Do not classify a detected physical object as a pothole.
+        if (cell.status === 'obstacle') continue;
 
-        // Exclude curb boundary transitions (step between footpath and road)
-        const leftCell  = c > 0 ? grid[r * COLS + (c - 1)] : null;
-        const rightCell = c < COLS - 1 ? grid[r * COLS + (c + 1)] : null;
-        const farCell   = r > 0 ? grid[(r - 1) * COLS + c] : null;
+        const baseline = floorBaseline[r];
+        const depth = getDepth(cell);
 
-        const isCurbInterface = (leftCell && leftCell.surfaceCategory !== cell.surfaceCategory && (leftCell.surfaceCategory === 'road' || cell.surfaceCategory === 'road')) ||
-                                (rightCell && rightCell.surfaceCategory !== cell.surfaceCategory && (rightCell.surfaceCategory === 'road' || cell.surfaceCategory === 'road'));
-        if (isCurbInterface) {
+        if (!Number.isFinite(baseline) || !Number.isFinite(depth)) {
           continue;
         }
 
-        // Bounded geometry check:
-        // A pothole must be bounded by normal ground laterally or in adjacent rows.
-        let boundedNeighbors = 0;
+        // In this relative-depth representation, a lower value than
+        // the baseline is treated as a possible depression.
+        const delta = (baseline - depth) / range;
 
-        if (leftCell) {
-          const leftD = _cellAvgDepth(leftCell, depthMap);
-          if (Math.abs(base - leftD) / range < POTHOLE_MIN_DELTA) boundedNeighbors++;
-        }
-        if (rightCell) {
-          const rightD = _cellAvgDepth(rightCell, depthMap);
-          if (Math.abs(base - rightD) / range < POTHOLE_MIN_DELTA) boundedNeighbors++;
-        }
-        if (farCell) {
-          const farBase = floorBaseline[r - 1] || base;
-          const farD = _cellAvgDepth(farCell, depthMap);
-          if (Math.abs(farBase - farD) / range < POTHOLE_MIN_DELTA) boundedNeighbors++;
+        // Reject weak depth changes and changes large enough to be
+        // more consistent with the separate drain/drop-off detector.
+        if (delta < MIN_DELTA || delta >= DRAIN_MIN_DELTA) {
+          continue;
         }
 
-        // Must have at least 1 verified ground neighbor to confirm bounded concavity
-        if (boundedNeighbors === 0) continue;
+        const left = c > 0 ? grid[r * COLS + c - 1] : null;
+        const right = c < COLS - 1 ? grid[r * COLS + c + 1] : null;
+        const far = r > 0 ? grid[(r - 1) * COLS + c] : null;
 
-        // Shadow Rejection: Depth must show true geometric depression, not flat pixels
-        const variance = _cellDepthVariance(cell, depthMap, cellD);
-        if (variance < 0.0001 && dropDelta < 0.20) {
-          continue; // Flat shadow artifact
+        // Reject transitions involving road boundaries or unknown
+        // neighboring surfaces.
+        const neighbors = [left, right, far].filter(Boolean);
+
+        if (neighbors.some(n => !isWalkable(n))) continue;
+
+        const hasRoadBoundary = neighbors.some(n =>
+          n.surfaceCategory !== cell.surfaceCategory &&
+          (n.surfaceCategory === 'road' || cell.surfaceCategory === 'road')
+        );
+
+        if (hasRoadBoundary) continue;
+
+        // A bounded depression should be surrounded by multiple
+        // neighboring cells whose depths are close to the baseline.
+        let confirmedNeighbors = 0;
+
+        for (const neighbor of neighbors) {
+          const neighborDepth = getDepth(neighbor);
+          if (!Number.isFinite(neighborDepth)) continue;
+
+          const neighborBaseline = floorBaseline[neighbor.r];
+
+          if (!Number.isFinite(neighborBaseline)) continue;
+
+          const neighborDelta =
+            Math.abs(neighborBaseline - neighborDepth) / range;
+
+          if (neighborDelta < 0.12) {
+            confirmedNeighbors++;
+          }
         }
 
-        const isConfident = dropDelta >= POTHOLE_CONFIDENT_DELTA && boundedNeighbors >= 2;
+        // Require at least two neighboring cells supporting normal ground.
+        if (confirmedNeighbors < 2) continue;
+
+        // Reject detected-object overlap.
+        if (
+          Array.isArray(tracks) &&
+          tracks.some(track => {
+            if (!Array.isArray(track.bbox) || track.bbox.length < 4) {
+              return false;
+            }
+
+            const [bx, by, bw, bh] = track.bbox;
+
+            if (![bx, by, bw, bh, vw, vh].every(Number.isFinite)) {
+              return false;
+            }
+
+            const cx = cell.x + cell.w / 2;
+            const cy = cell.y + cell.h / 2;
+
+            return (
+              cx >= bx &&
+              cx <= bx + bw &&
+              cy >= by &&
+              cy <= by + bh
+            );
+          })
+        ) {
+          continue;
+        }
+
+        // Require a stronger signal for a confident classification.
+        const confident =
+          delta >= CONFIDENT_DELTA &&
+          confirmedNeighbors >= 3;
+
         const side = c < 2 ? 'left' : c > 2 ? 'right' : 'center';
-        const isNear = r === 2;
+        const near = r === 2;
 
         const hazard = _buildHazardResult({
           category: 'pothole',
-          confidence: isConfident ? 'confident' : 'uncertain',
-          riskLevel: side === 'center' ? (isNear ? 'high' : 'medium') : 'medium',
+          confidence: confident ? 'confident' : 'uncertain',
+          riskLevel: 'medium',
           side,
-          row: isNear ? 'near' : 'mid',
-          proximity: isNear ? 'immediate' : 'close',
+          row: near ? 'near' : 'mid',
+          proximity: near ? 'immediate' : 'close',
           cells: [cell],
-          delta: dropDelta,
-          vw, vh,
-          alertMessageConfident: side === 'center'
-            ? 'Pothole detected ahead. Step carefully.'
-            : `Pothole on your ${side}. Step carefully.`,
-          alertMessageUncertain: side === 'center'
-            ? 'Possible pothole ahead.'
-            : `Possible pothole on your ${side}.`
+          delta,
+          vw,
+          vh,
+          alertMessageConfident:
+            side === 'center'
+              ? 'Possible ground depression ahead. Stop and check.'
+              : `Possible ground depression on your ${side}. Stop and check.`,
+          alertMessageUncertain:
+            'Possible uneven ground detected. Verify before proceeding.'
         });
 
+        // Avoid claiming a confirmed pothole based on relative depth alone.
         cell.status = 'caution';
-        cell.zone = isNear ? 'danger' : 'close';
+        cell.zone = near ? 'danger' : 'close';
         cell.src = 'hazard-pothole';
 
         results.push(hazard);
@@ -328,19 +412,19 @@
     // Check lateral curb boundaries (adjacent columns in same row)
     for (let r = 1; r < ROWS; r++) {
       for (let c = 0; c < COLS - 1; c++) {
-        const leftCell  = grid[r * COLS + c];
+        const leftCell = grid[r * COLS + c];
         const rightCell = grid[r * COLS + c + 1];
 
-        const leftCat  = leftCell.surfaceCategory;
+        const leftCat = leftCell.surfaceCategory;
         const rightCat = rightCell.surfaceCategory;
 
         const isFootToRoad = (leftCat === 'footpath' && rightCat === 'road') ||
-                             (leftCat === 'road' && rightCat === 'footpath');
+          (leftCat === 'road' && rightCat === 'footpath');
 
         if (!isFootToRoad) continue;
 
         // Measure elevation step at boundary
-        const leftD  = _cellAvgDepth(leftCell, depthMap);
+        const leftD = _cellAvgDepth(leftCell, depthMap);
         const rightD = _cellAvgDepth(rightCell, depthMap);
         const stepDelta = Math.abs(leftD - rightD) / range;
 
@@ -373,11 +457,11 @@
     // Check longitudinal curb (row 2 is footpath, row 1 is road ahead)
     for (let c = 1; c <= 3; c++) {
       const nearCell = grid[2 * COLS + c];
-      const midCell  = grid[1 * COLS + c];
+      const midCell = grid[1 * COLS + c];
 
       if (nearCell.surfaceCategory === 'footpath' && midCell.surfaceCategory === 'road') {
         const nearD = _cellAvgDepth(nearCell, depthMap);
-        const midD  = _cellAvgDepth(midCell, depthMap);
+        const midD = _cellAvgDepth(midCell, depthMap);
         const stepDelta = Math.abs(nearD - midD) / range;
 
         if (stepDelta >= CURB_MIN_STEP) {
@@ -698,7 +782,7 @@
     // Descending stairs drop down away from camera: floor drops below baseline (negative disparity deviation)
     // Ascending stairs climb up towards upper half of frame: mid ground is elevated closer to camera
     const yMidStart = Math.floor(dh * 0.35);
-    const yMidEnd   = Math.floor(dh * 0.65);
+    const yMidEnd = Math.floor(dh * 0.65);
     let midSum = 0, midCount = 0;
     for (let y = yMidStart; y < yMidEnd; y++) {
       if (validRows[y]) {
@@ -716,7 +800,7 @@
     // Check downward drop-offs from grid or profile
     const dropCells = grid.filter(c => (c.r === 1 || c.r === 2) && c.c >= 1 && c.c <= 3 && c.status === 'dropoff');
     const isDescending = dropCells.length >= 1 || elevation <= -0.05;
-    const isAscending  = elevation >= 0.05 && !isDescending;
+    const isAscending = elevation >= 0.05 && !isDescending;
 
     let category = 'stairs-ambiguous';
     let riskLevel = 'medium';
@@ -839,9 +923,8 @@
       existing.maxDelta = Math.max(existing.maxDelta, hazard.delta);
 
       // Multi-frame escalation: uncertain hazard persisting >= CONFIRM_FRAMES becomes confident
-      if (persistence >= CONFIRM_FRAMES && confidence === 'uncertain') {
-        confidence = 'confident';
-      }
+      // Persistence alone is not proof that a hazard is real.
+      // Keep the detector's original confidence classification.
     } else {
       _activeTrackers.set(key, {
         category: hazard.category,

@@ -32,8 +32,8 @@
   const TARGET_SIZE = 416;
   const NUM_ANCHORS = 3549;
   const CLASS_STAIRS_IDX = 1; // Class 0: 'object', Class 1: 'stairs'
-  const DEFAULT_CONF_THRESHOLD = 0.25;
-  const CONFIDENT_THRESHOLD = 0.45;
+  const DEFAULT_CONF_THRESHOLD = 0.60;
+  const CONFIDENT_THRESHOLD = 0.75;
   const DEFAULT_IOU_THRESHOLD = 0.45;
   const MODEL_PATH = '/models/stairs-yolov8n.onnx';
 

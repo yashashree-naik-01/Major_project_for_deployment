@@ -72,8 +72,8 @@
     hazard: {
       potholeMinDepthDelta: 0.16,
       potholeConfidentDelta: 0.28,
-      drainMinDepthDelta: 0.32,
-      drainConfidentDelta: 0.42,
+      drainMinDepthDelta: 0.50,
+      drainConfidentDelta: 0.60,
       curbMinStepDelta: 0.08,
       curbConfidentDelta: 0.14,
       raisedSurfaceMinDelta: 0.10,

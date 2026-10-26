@@ -657,7 +657,7 @@ window.visionGuideAPI = {
     return true;
   },
   navigateTo(name) {
-    if (window.navigationUI) return window.navigationUI.navigateToName(name);
+    if (window.navigationUI) { if(page!=='navigate')go('navigate'); return window.navigationUI.navigateToName(name); }
     const query=String(name||'').trim().toLowerCase();
     const found=places.find(p=>p.name.toLowerCase()===query)||places.find(p=>(p.name+' '+p.address).toLowerCase().includes(query));
     if (!found) { speak(`I could not find ${name} in your saved places.`); return false; }
